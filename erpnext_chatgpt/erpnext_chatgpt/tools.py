@@ -135,6 +135,57 @@ def lookup_entity(entity_type, search_term, limit=20, fuzzy_rerank=True):
                     for r in fallback_results
                 ]
 
+        # Stage 1b: Broad fuzzy search fallback
+        # If search_link and LIKE both failed, fetch a larger sample and apply fuzzy matching
+        # This handles cases like "swissski" → "Swiss-Ski" where the search term doesn't
+        # appear as a substring but is phonetically/structurally similar
+        if not candidates and fuzzy_rerank:
+            logger.debug(f"lookup_entity: No candidates found, trying broad fuzzy search for '{search_term}'")
+
+            # Fetch a sample of entities to fuzzy match against
+            broad_results = frappe.db.get_all(
+                doctype,
+                filters=filters,
+                fields=['name', display_field] if display_field != 'name' else ['name'],
+                limit=200  # Fetch more to find fuzzy matches
+            )
+
+            if broad_results:
+                # Normalize search term for comparison
+                search_normalized = search_term.lower().replace(' ', '').replace('-', '').replace('_', '')
+
+                # Score each result
+                scored_results = []
+                for r in broad_results:
+                    name_value = r.get(display_field, r['name']) or r['name']
+                    name_normalized = name_value.lower().replace(' ', '').replace('-', '').replace('_', '')
+
+                    # Calculate similarity score
+                    score = 0
+
+                    # Exact normalized match (e.g., "swissski" == "swissski" from "Swiss-Ski")
+                    if search_normalized == name_normalized:
+                        score = 100
+                    # Normalized containment
+                    elif search_normalized in name_normalized:
+                        score = 95
+                    elif name_normalized in search_normalized:
+                        score = 90
+                    else:
+                        # Sequence matching
+                        seq_score = int(SequenceMatcher(None, search_normalized, name_normalized).ratio() * 100)
+                        score = seq_score
+
+                    # Only include if score is reasonable (above 60%)
+                    if score >= 60:
+                        scored_results.append((r['name'], name_value, '', score))
+
+                # Sort by score and take top matches
+                scored_results.sort(key=lambda x: x[3], reverse=True)
+                candidates = [(r[0], r[1], r[2]) for r in scored_results[:limit * 2]]
+
+                logger.debug(f"lookup_entity: Broad fuzzy search found {len(candidates)} candidates")
+
         if not candidates:
             return json.dumps({
                 'entity_type': entity_type,
