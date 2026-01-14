@@ -9,6 +9,93 @@ from erpnext_chatgpt.erpnext_chatgpt.tools import get_tools, available_functions
 logger = frappe.logger("aiassistant", allow_site=True)
 logger.setLevel(logging.DEBUG)
 
+import re
+
+def auto_link_document_ids(text):
+    """
+    Automatically convert ERPNext document IDs to clickable markdown links.
+    Detects patterns like MAT-DN-2026-00006, SI-2024-00001, etc.
+    """
+    # Map document prefixes to their URL doctypes
+    doctype_mappings = {
+        # Delivery Note patterns
+        'MAT-DN': 'delivery-note',
+        'DN': 'delivery-note',
+        # Sales Invoice patterns
+        'SI': 'sales-invoice',
+        'SINV': 'sales-invoice',
+        'ACC-SINV': 'sales-invoice',
+        # Sales Order patterns
+        'SO': 'sales-order',
+        'SAL-ORD': 'sales-order',
+        # Purchase Order patterns
+        'PO': 'purchase-order',
+        'PUR-ORD': 'purchase-order',
+        # Purchase Invoice patterns
+        'PI': 'purchase-invoice',
+        'PINV': 'purchase-invoice',
+        'ACC-PINV': 'purchase-invoice',
+        # Quotation patterns
+        'QTN': 'quotation',
+        'SAL-QTN': 'quotation',
+        # Customer patterns (usually just names, handled separately)
+        # Supplier patterns
+        'SUP': 'supplier',
+        # Item patterns
+        'ITEM': 'item',
+        # Employee patterns
+        'HR-EMP': 'employee',
+        'EMP': 'employee',
+        # Lead patterns
+        'CRM-LEAD': 'lead',
+        'LEAD': 'lead',
+        # Service Protocol (custom)
+        'SVP': 'service-protocol',
+        # Stock Entry
+        'MAT-STE': 'stock-entry',
+        'STE': 'stock-entry',
+        # Material Request
+        'MAT-MR': 'material-request',
+        # Payment Entry
+        'ACC-PAY': 'payment-entry',
+        'PE': 'payment-entry',
+        # Journal Entry
+        'ACC-JV': 'journal-entry',
+        'JV': 'journal-entry',
+    }
+
+    # Build regex pattern for all prefixes
+    # Sort by length (longest first) to match longer prefixes before shorter ones
+    sorted_prefixes = sorted(doctype_mappings.keys(), key=len, reverse=True)
+    prefix_pattern = '|'.join(re.escape(p) for p in sorted_prefixes)
+
+    # Pattern matches: PREFIX-YEAR-NUMBER or PREFIX-NUMBER
+    # Examples: MAT-DN-2026-00006, SI-2024-00001, SVP-2025-0001
+    pattern = rf'\b(({prefix_pattern})-(\d{{4}})-(\d{{4,6}})|({prefix_pattern})-(\d{{4,6}}))\b'
+
+    def replace_match(match):
+        doc_id = match.group(0)
+
+        # Check if already inside a markdown link [...](...)
+        # by looking at surrounding context
+        start = match.start()
+        prefix_text = text[max(0, start-2):start]
+        if prefix_text.endswith('](') or prefix_text.endswith('['):
+            return doc_id  # Already in a link, don't modify
+
+        # Find which prefix matches
+        for prefix, doctype_url in doctype_mappings.items():
+            if doc_id.startswith(prefix + '-'):
+                return f'[{doc_id}](/app/{doctype_url}/{doc_id})'
+
+        return doc_id  # No match found, return as-is
+
+    # Apply regex replacement
+    result = re.sub(pattern, replace_match, text)
+
+    return result
+
+
 def get_system_instructions():
     """Get system instructions with current date and user context."""
     current_user = frappe.session.user
@@ -254,10 +341,14 @@ def ask_openai_question(conversation: List[Dict[str, Any]]) -> Dict[str, Any]:
                         final_args = json.loads(tool_call.function.arguments)
                         logger.debug(f"Final answer received after {iteration} iterations")
 
+                        # Auto-link document IDs in the response
+                        message = final_args.get("message", "")
+                        message = auto_link_document_ids(message)
+
                         # Return the final answer in the expected format
                         return {
                             "role": "assistant",
-                            "content": final_args.get("message", ""),
+                            "content": message,
                             "tool_usage": tool_usage_log,
                             "summary": final_args.get("summary"),
                             "iterations": iteration
