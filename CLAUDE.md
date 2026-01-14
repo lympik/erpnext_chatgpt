@@ -99,6 +99,35 @@ This is an ERPNext app that integrates OpenAI capabilities into the ERPNext ERP 
 - **Frappe Framework Integration**: Built on top of Frappe/ERPNext framework, using its ORM, API patterns, and whitelisting mechanisms
 - **OpenAI Client**: Uses OpenAI Python SDK v1.32.0 for GPT-4 model interactions
 - **Tool System**: Implements function calling with 14+ ERPNext-specific tools for data retrieval (sales invoices, employees, stock levels, etc.)
+- **Entity Resolution**: The `lookup_entity` tool resolves informal entity names to exact database identifiers before querying documents
+
+### Entity Resolution Pattern
+
+When users mention entities by informal names (e.g., "swissski" for "Swiss Ski Verband"), the AI should:
+
+1. **First** call `lookup_entity(entity_type='customer', search_term='swissski')`
+2. Get the exact name from `best_match.id` (e.g., "Swiss Ski Verband")
+3. **Then** call the appropriate tool with the exact name (e.g., `list_delivery_notes(customer='Swiss Ski Verband')`)
+
+The `lookup_entity` tool uses:
+- **Stage 1**: Frappe's `search_link` for fast, permission-aware candidate generation
+- **Stage 2**: Fuzzy re-ranking using `SequenceMatcher` for typo tolerance
+
+Supported entity types: `customer`, `supplier`, `item`, `employee`, `lead`, `contact`
+
+#### Testing Entity Lookup
+```python
+# In bench console
+import frappe
+from erpnext_chatgpt.erpnext_chatgpt.tools import lookup_entity
+import json
+
+# Test fuzzy customer lookup
+result = lookup_entity("customer", "swissski")
+data = json.loads(result)
+print(f"Best match: {data.get('best_match')}")
+print(f"All matches: {data.get('matches')}")
+```
 
 ### Key Files
 - `erpnext_chatgpt/api.py`: Main API endpoints for OpenAI integration
@@ -411,3 +440,48 @@ Key methods for document manipulation:
 - `doc.cancel()` - Cancel a submitted document
 - `doc.delete()` - Delete a document
 - `frappe.db.commit()` - Commit database transaction
+
+## Recommended System Instructions
+
+The AI assistant's behavior is controlled by the system instructions configured in OpenAI Settings. To ensure proper entity resolution and accurate queries, include guidance about the `lookup_entity` tool:
+
+### Example System Instructions Template
+
+```
+You are an AI assistant for {company}, helping users query and manage ERPNext data.
+
+Current User: {user_name} ({user_email})
+Roles: {user_roles}
+Date/Time: {current_datetime}
+
+## IMPORTANT: Entity Name Resolution
+
+When users mention customers, suppliers, items, or other entities by informal, abbreviated, or partial names:
+
+1. ALWAYS use lookup_entity() FIRST to find the exact database name
+2. Use the `best_match.id` value from the result as the exact identifier
+3. THEN use that exact name in subsequent queries
+
+Example workflow:
+- User: "Find delivery notes for swissski"
+- Step 1: lookup_entity(entity_type="customer", search_term="swissski")
+- Result: best_match.id = "Swiss Ski Verband"
+- Step 2: list_delivery_notes(customer="Swiss Ski Verband")
+
+This ensures accurate results even when users use nicknames, abbreviations, or misspellings.
+
+## Available Entity Types for Lookup
+- customer, supplier, item, employee, lead, contact
+
+## Response Guidelines
+- Be concise and professional
+- Present data in easy-to-read formats
+- Always confirm which entity was matched when using lookup_entity
+```
+
+### Placeholders Available
+- `{user_name}` - Current user's full name
+- `{user_email}` - Current user's email
+- `{user_roles}` - Comma-separated list of user roles
+- `{company}` - Default company
+- `{current_datetime}` - Current date and time

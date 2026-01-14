@@ -25,6 +25,248 @@ def json_serial(obj):
         return ""
 
 
+def lookup_entity(entity_type, search_term, limit=20, fuzzy_rerank=True):
+    """
+    Look up an entity (customer, supplier, item, etc.) using Frappe's built-in
+    search_link functionality. This is fast, permission-aware, and searches
+    across configured search fields.
+
+    Use this tool FIRST when a user mentions an entity by an informal or
+    partial name to resolve it to the exact database name before querying
+    documents.
+
+    Example: User says "swissski" -> lookup finds "Swiss Ski Verband"
+    """
+    from frappe.desk.search import search_link
+    from difflib import SequenceMatcher
+
+    # Map user-friendly entity types to DocTypes and their display fields
+    # Only master data entities - not documents
+    entity_config = {
+        'customer': {
+            'doctype': 'Customer',
+            'display_field': 'customer_name',
+            'filters': {'disabled': 0}
+        },
+        'supplier': {
+            'doctype': 'Supplier',
+            'display_field': 'supplier_name',
+            'filters': {'disabled': 0}
+        },
+        'item': {
+            'doctype': 'Item',
+            'display_field': 'item_name',
+            'filters': {'disabled': 0}
+        },
+        'employee': {
+            'doctype': 'Employee',
+            'display_field': 'employee_name',
+            'filters': {'status': 'Active'}
+        },
+        'lead': {
+            'doctype': 'Lead',
+            'display_field': 'lead_name',
+            'filters': {}
+        },
+        'contact': {
+            'doctype': 'Contact',
+            'display_field': 'name',
+            'filters': {}
+        }
+    }
+
+    # Normalize entity type
+    entity_type_lower = entity_type.lower().replace(' ', '_').replace('-', '_')
+
+    if entity_type_lower not in entity_config:
+        # Try to find a close match
+        available_types = list(entity_config.keys())
+        return json.dumps({
+            'error': f"Unknown entity type: '{entity_type}'",
+            'available_types': available_types,
+            'hint': 'Use one of the available entity types'
+        }, default=json_serial)
+
+    config = entity_config[entity_type_lower]
+    doctype = config['doctype']
+    display_field = config['display_field']
+    filters = config['filters']
+
+    try:
+        # Stage 1: Use Frappe's search_link for fast, permission-aware candidate generation
+        # search_link returns a list of tuples: [(value, label, description), ...]
+        candidates = search_link(
+            doctype=doctype,
+            txt=search_term,
+            page_length=limit * 2 if fuzzy_rerank else limit,  # Get more if we'll re-rank
+            filters=filters
+        )
+
+        logger.debug(f"lookup_entity: search_link returned {len(candidates)} candidates for '{search_term}' in {doctype}")
+
+        if not candidates:
+            # No results from search_link, try a broader search
+            # Sometimes search_link is too strict, so fall back to LIKE query
+            fallback_results = frappe.db.get_all(
+                doctype,
+                filters={
+                    **filters,
+                    display_field: ['like', f'%{search_term}%']
+                } if display_field != 'name' else filters,
+                fields=['name', display_field] if display_field != 'name' else ['name'],
+                limit=limit
+            )
+
+            if not fallback_results and display_field != 'name':
+                # Try searching in name field too
+                fallback_results = frappe.db.get_all(
+                    doctype,
+                    filters={
+                        **filters,
+                        'name': ['like', f'%{search_term}%']
+                    },
+                    fields=['name', display_field],
+                    limit=limit
+                )
+
+            if fallback_results:
+                candidates = [
+                    (r['name'], r.get(display_field, r['name']), '')
+                    for r in fallback_results
+                ]
+
+        if not candidates:
+            return json.dumps({
+                'entity_type': entity_type,
+                'doctype': doctype,
+                'search_term': search_term,
+                'matches': [],
+                'best_match': None,
+                'message': f"No {entity_type} found matching '{search_term}'"
+            }, default=json_serial)
+
+        # Convert candidates to structured format
+        results = []
+        for candidate in candidates:
+            # search_link returns tuples: (value, label, description)
+            if isinstance(candidate, (list, tuple)):
+                value = candidate[0] if len(candidate) > 0 else ''
+                label = candidate[1] if len(candidate) > 1 else value
+                description = candidate[2] if len(candidate) > 2 else ''
+            else:
+                value = str(candidate)
+                label = value
+                description = ''
+
+            results.append({
+                'id': value,
+                'name': label or value,
+                'description': description,
+                'match_score': 100  # Will be recalculated if fuzzy_rerank
+            })
+
+        # Stage 2: Optional fuzzy re-ranking using SequenceMatcher
+        if fuzzy_rerank and results:
+            search_lower = search_term.lower().replace(' ', '').replace('-', '')
+
+            for result in results:
+                name_value = (result['name'] or result['id'] or '').lower()
+                name_compact = name_value.replace(' ', '').replace('-', '')
+
+                # Multiple scoring strategies
+                scores = []
+
+                # 1. Exact match
+                if search_term.lower() == name_value:
+                    scores.append(100)
+
+                # 2. Exact containment (search in name or name in search)
+                if search_lower in name_compact:
+                    scores.append(95)
+                elif name_compact in search_lower:
+                    scores.append(90)
+
+                # 3. Word boundary matching
+                # "swissski" should match "Swiss Ski" well
+                if search_lower in name_compact or name_compact.startswith(search_lower):
+                    scores.append(88)
+
+                # 4. Sequence matching (handles typos and partial matches)
+                seq_score = int(SequenceMatcher(None, search_lower, name_compact).ratio() * 100)
+                scores.append(seq_score)
+
+                # 5. Also compare against the ID
+                id_lower = (result['id'] or '').lower().replace(' ', '').replace('-', '')
+                if search_lower in id_lower or id_lower in search_lower:
+                    scores.append(85)
+
+                # Take the best score
+                result['match_score'] = max(scores) if scores else 0
+
+            # Sort by score descending
+            results.sort(key=lambda x: x['match_score'], reverse=True)
+
+        # Limit results
+        results = results[:limit]
+
+        return json.dumps({
+            'entity_type': entity_type,
+            'doctype': doctype,
+            'search_term': search_term,
+            'matches': results,
+            'best_match': results[0] if results else None,
+            'total_found': len(results)
+        }, default=json_serial)
+
+    except Exception as e:
+        logger.error(f"Error in lookup_entity: {str(e)}")
+        frappe.log_error(f"lookup_entity error for {entity_type}/{search_term}: {str(e)}", "Entity Lookup Error")
+        return json.dumps({
+            'error': str(e),
+            'entity_type': entity_type,
+            'search_term': search_term
+        }, default=json_serial)
+
+
+lookup_entity_tool = {
+    "type": "function",
+    "function": {
+        "name": "lookup_entity",
+        "description": """Look up a master data entity by name to find the exact database identifier.
+IMPORTANT: Use this tool FIRST when a user mentions a customer, supplier, item, contact, employee, or lead
+by an informal, abbreviated, or partial name. This resolves names like 'swissski' to 'Swiss Ski Verband'.
+
+Workflow:
+1. User says 'Find delivery notes for swissski'
+2. FIRST call lookup_entity(entity_type='customer', search_term='swissski')
+3. Get exact name like 'Swiss Ski Verband' from best_match.id
+4. THEN call list_delivery_notes(customer='Swiss Ski Verband')
+
+This ensures accurate results by resolving informal names to exact database entries.""",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "entity_type": {
+                    "type": "string",
+                    "enum": ["customer", "supplier", "item", "employee", "lead", "contact"],
+                    "description": "Type of master data entity to search for"
+                },
+                "search_term": {
+                    "type": "string",
+                    "description": "The name or partial name to search for (can be informal, abbreviated, or misspelled)"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of results to return (default: 20)",
+                    "default": 20
+                }
+            },
+            "required": ["entity_type", "search_term"]
+        }
+    }
+}
+
+
 def get_sales_invoices(start_date=None, end_date=None):
     try:
         filters = {}
@@ -2148,6 +2390,9 @@ get_service_protocol_tool = {
 
 def get_tools():
     return [
+        # Entity lookup tool - should be used first to resolve informal names
+        lookup_entity_tool,
+        # Document query tools
         get_sales_invoices_tool,
         get_sales_invoice_tool,
         list_invoices_tool,
@@ -2174,6 +2419,7 @@ def get_tools():
 
 
 available_functions = {
+    "lookup_entity": lookup_entity,
     "get_sales_invoices": get_sales_invoices,
     "get_sales_invoice": get_sales_invoice,
     "list_invoices": list_invoices,
