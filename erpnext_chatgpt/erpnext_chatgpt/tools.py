@@ -25,6 +25,50 @@ def json_serial(obj):
         return ""
 
 
+def final_answer(message, summary=None):
+    """
+    Signal that the AI has completed all necessary queries and is ready to respond.
+    This tool is called when the AI wants to deliver the final answer to the user.
+    """
+    return json.dumps({
+        '_final_answer': True,
+        'message': message,
+        'summary': summary
+    }, default=json_serial)
+
+
+final_answer_tool = {
+    "type": "function",
+    "function": {
+        "name": "final_answer",
+        "description": """Call this tool to deliver your final response to the user.
+
+IMPORTANT: You MUST call this tool to respond to the user. Do not try to respond directly.
+
+Call this ONLY after you have:
+1. Resolved any entity names using lookup_entity (if needed)
+2. Retrieved the requested data using appropriate query tools
+3. Analyzed and formatted the results
+
+Your message should be well-formatted with markdown, include relevant data, and directly answer the user's question.""",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": "The complete, formatted response to show the user. Use markdown for formatting. Include links to ERPNext documents where appropriate."
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "A brief one-line summary (optional)"
+                }
+            },
+            "required": ["message"]
+        }
+    }
+}
+
+
 def lookup_entity(entity_type, search_term, limit=20, fuzzy_rerank=True):
     """
     Look up an entity (customer, supplier, item, etc.) using Frappe's built-in
@@ -283,17 +327,16 @@ lookup_entity_tool = {
     "type": "function",
     "function": {
         "name": "lookup_entity",
-        "description": """Look up a master data entity by name to find the exact database identifier.
-IMPORTANT: Use this tool FIRST when a user mentions a customer, supplier, item, contact, employee, or lead
-by an informal, abbreviated, or partial name. This resolves names like 'swissski' to 'Swiss Ski Verband'.
+        "description": """PREPARATORY STEP: Look up a master data entity by name to find the exact database identifier.
 
-Workflow:
-1. User says 'Find delivery notes for swissski'
-2. FIRST call lookup_entity(entity_type='customer', search_term='swissski')
-3. Get exact name like 'Swiss Ski Verband' from best_match.id
-4. THEN call list_delivery_notes(customer='Swiss Ski Verband')
+This is NOT the final answer - after getting the entity ID, you MUST continue with the actual query.
 
-This ensures accurate results by resolving informal names to exact database entries.""",
+REQUIRED WORKFLOW - Always complete ALL steps:
+1. User: 'Find delivery notes for swissski'
+2. Step 1: lookup_entity(entity_type='customer', search_term='swissski') → gets 'Swiss-Ski'
+3. Step 2: list_delivery_notes(customer='Swiss-Ski') → THIS IS REQUIRED, do not stop after step 1!
+
+CRITICAL: After calling lookup_entity, you MUST call the appropriate query tool (list_delivery_notes, list_invoices, etc.) to complete the user's request. Never respond to the user after only calling lookup_entity.""",
         "parameters": {
             "type": "object",
             "properties": {
@@ -2441,6 +2484,8 @@ get_service_protocol_tool = {
 
 def get_tools():
     return [
+        # Final answer tool - MUST be called to respond to user
+        final_answer_tool,
         # Entity lookup tool - should be used first to resolve informal names
         lookup_entity_tool,
         # Document query tools
@@ -2470,6 +2515,7 @@ def get_tools():
 
 
 available_functions = {
+    "final_answer": final_answer,
     "lookup_entity": lookup_entity,
     "get_sales_invoices": get_sales_invoices,
     "get_sales_invoice": get_sales_invoice,

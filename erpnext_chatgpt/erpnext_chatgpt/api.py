@@ -217,39 +217,77 @@ def ask_openai_question(conversation: List[Dict[str, Any]]) -> Dict[str, Any]:
         logger.debug(f"Conversation: {json.dumps(conversation)}")
 
         tools = get_tools()
-        response = client.chat.completions.create(
-            model=model,
-            messages=conversation,
-            tools=tools,
-            tool_choice="auto"
-        )
 
-        response_message = response.choices[0].message
+        # Agentic tool-only loop
+        # Force the AI to use tools until it calls final_answer
+        max_iterations = 15  # Safety limit to prevent infinite loops
+        iteration = 0
 
-        logger.debug(f"OpenAI Response: {response_message}")
+        while iteration < max_iterations:
+            iteration += 1
 
-        tool_calls = response_message.tool_calls
-        if tool_calls:
+            # Use tool_choice="required" to force tool usage
+            # The AI MUST call a tool - it cannot respond with just text
+            response = client.chat.completions.create(
+                model=model,
+                messages=conversation,
+                tools=tools,
+                tool_choice="required"
+            )
+
+            response_message = response.choices[0].message
+            logger.debug(f"OpenAI Response (iteration {iteration}): {response_message}")
+
+            tool_calls = response_message.tool_calls
+            if not tool_calls:
+                # This shouldn't happen with tool_choice="required", but handle it
+                logger.warning("No tool calls returned despite tool_choice=required")
+                response_data = response_message.model_dump()
+                response_data['tool_usage'] = tool_usage_log
+                return response_data
+
+            # Check if any tool call is final_answer
+            for tool_call in tool_calls:
+                if tool_call.function.name == "final_answer":
+                    # Extract the final answer and return it
+                    try:
+                        final_args = json.loads(tool_call.function.arguments)
+                        logger.debug(f"Final answer received after {iteration} iterations")
+
+                        # Return the final answer in the expected format
+                        return {
+                            "role": "assistant",
+                            "content": final_args.get("message", ""),
+                            "tool_usage": tool_usage_log,
+                            "summary": final_args.get("summary"),
+                            "iterations": iteration
+                        }
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Failed to parse final_answer arguments: {e}")
+                        return {
+                            "role": "assistant",
+                            "content": "I encountered an error formatting my response.",
+                            "tool_usage": tool_usage_log,
+                            "error": str(e)
+                        }
+
+            # No final_answer yet - handle the tool calls and continue
             conversation.append(response_message.model_dump())
             conversation, tool_usage_log = handle_tool_calls(tool_calls, conversation, tool_usage_log)
 
-            # Trim again if needed after tool calls
+            # Trim conversation if needed
             conversation = trim_conversation_to_token_limit(conversation, max_tokens)
 
-            second_response = client.chat.completions.create(
-                model=model,
-                messages=conversation
-            )
+            logger.debug(f"Handled {len(tool_calls)} tool calls, continuing to iteration {iteration + 1}")
 
-            # Return response with tool usage information
-            response_data = second_response.choices[0].message.model_dump()
-            response_data['tool_usage'] = tool_usage_log
-            return response_data
-
-        # Return response with empty tool usage if no tools were called
-        response_data = response_message.model_dump()
-        response_data['tool_usage'] = tool_usage_log
-        return response_data
+        # If we hit max iterations, force a response
+        logger.warning(f"Hit max iterations ({max_iterations}) without final_answer")
+        return {
+            "role": "assistant",
+            "content": "I was unable to complete the request within the allowed number of steps. Please try a simpler query.",
+            "tool_usage": tool_usage_log,
+            "error": "max_iterations_reached"
+        }
     except Exception as e:
         frappe.log_error(str(e), "OpenAI API Error")
         return {"error": str(e), "tool_usage": []}
