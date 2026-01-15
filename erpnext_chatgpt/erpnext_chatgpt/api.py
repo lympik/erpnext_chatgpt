@@ -345,6 +345,9 @@ def handle_tool_calls(tool_calls: List[Any], conversation: List[Dict[str, Any]],
         try:
             function_response = function_to_call(**function_args)
 
+            # Initialize response_data for entity extraction
+            response_data = {}
+
             # Parse response to get summary info if it's JSON
             try:
                 response_data = json.loads(function_response)

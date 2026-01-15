@@ -354,6 +354,7 @@ function renderToolUsageToggle(toolUsage, messageId) {
   // Collect all fetched entities from all tool calls
   const allEntities = [];
   toolUsage.forEach(tool => {
+    console.log("Tool usage entry:", tool.tool_name, "fetched_entities:", tool.fetched_entities);
     if (tool.fetched_entities && tool.fetched_entities.length > 0) {
       tool.fetched_entities.forEach(entity => {
         // Avoid duplicates
@@ -363,6 +364,7 @@ function renderToolUsageToggle(toolUsage, messageId) {
       });
     }
   });
+  console.log("All entities for chips:", allEntities);
 
   return `
     <div class="mt-2">
