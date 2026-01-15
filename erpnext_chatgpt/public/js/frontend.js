@@ -351,6 +351,19 @@ function scrollToBottom() {
 function renderToolUsageToggle(toolUsage, messageId) {
   if (!toolUsage || toolUsage.length === 0) return "";
 
+  // Collect all fetched entities from all tool calls
+  const allEntities = [];
+  toolUsage.forEach(tool => {
+    if (tool.fetched_entities && tool.fetched_entities.length > 0) {
+      tool.fetched_entities.forEach(entity => {
+        // Avoid duplicates
+        if (!allEntities.find(e => e.id === entity.id && e.doctype === entity.doctype)) {
+          allEntities.push(entity);
+        }
+      });
+    }
+  });
+
   return `
     <div class="mt-2">
       <button
@@ -360,11 +373,85 @@ function renderToolUsageToggle(toolUsage, messageId) {
       >
         ℹ️ <span id="${messageId}-toggle-text">Show</span> data access info (${toolUsage.length} ${toolUsage.length === 1 ? 'query' : 'queries'})
       </button>
+      ${renderEntityChips(allEntities, messageId)}
       <div id="${messageId}-details" style="display: none;" class="mt-2">
         ${renderToolUsageDetails(toolUsage)}
       </div>
     </div>
   `;
+}
+
+function renderEntityChips(entities, messageId) {
+  if (!entities || entities.length === 0) return "";
+
+  const chips = entities.map((entity, index) => {
+    const chipId = `${messageId}-chip-${index}`;
+    const docTypeUrl = entity.doctype.toLowerCase().replace(/ /g, '-');
+    const encodedId = encodeURIComponent(entity.id);
+    const url = `/app/${docTypeUrl}/${encodedId}`;
+
+    // Truncate long labels
+    const displayLabel = entity.label.length > 25
+      ? entity.label.substring(0, 22) + '...'
+      : entity.label;
+
+    return `
+      <a
+        href="${url}"
+        target="_blank"
+        class="entity-chip"
+        id="${chipId}"
+        title="${entity.doctype}: ${entity.label}"
+        style="
+          display: inline-flex;
+          align-items: center;
+          padding: 4px 10px;
+          margin: 2px;
+          background-color: #e9ecef;
+          border: 1px solid #ced4da;
+          border-radius: 16px;
+          font-size: 12px;
+          color: #495057;
+          text-decoration: none;
+          white-space: nowrap;
+          transition: background-color 0.2s, border-color 0.2s;
+        "
+        onmouseover="this.style.backgroundColor='#dee2e6'; this.style.borderColor='#adb5bd';"
+        onmouseout="this.style.backgroundColor='#e9ecef'; this.style.borderColor='#ced4da';"
+      >
+        <span style="margin-right: 4px;">${getEntityIcon(entity.doctype)}</span>
+        ${displayLabel}
+      </a>
+    `;
+  }).join('');
+
+  return `
+    <div style="display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; margin-bottom: 4px;">
+      ${chips}
+    </div>
+  `;
+}
+
+function getEntityIcon(doctype) {
+  const icons = {
+    'Customer': '👤',
+    'Supplier': '🏭',
+    'Item': '📦',
+    'Employee': '👨‍💼',
+    'Lead': '🎯',
+    'Contact': '📇',
+    'Delivery Note': '🚚',
+    'Sales Invoice': '🧾',
+    'Sales Order': '📋',
+    'Purchase Order': '🛒',
+    'Purchase Invoice': '📄',
+    'Quotation': '💬',
+    'Service Protocol': '🔧',
+    'Stock Entry': '📥',
+    'Payment Entry': '💳',
+    'Journal Entry': '📒',
+  };
+  return icons[doctype] || '📄';
 }
 
 // Make toggleToolUsage globally available for onclick events

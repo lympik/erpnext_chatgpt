@@ -153,6 +153,169 @@ def get_openai_client():
     # Don't pass any proxy-related parameters
     return OpenAI(api_key=api_key)
 
+def extract_fetched_entities(function_name, response_data):
+    """
+    Extract document/entity references from tool results for quick access chips.
+    Returns a list of {id, doctype, label} objects.
+    """
+    entities = []
+
+    if not response_data or not isinstance(response_data, dict):
+        return entities
+
+    # Map function names to their result keys and doctypes
+    function_mappings = {
+        'lookup_entity': {
+            'key': 'best_match',
+            'doctype_field': 'doctype',
+            'id_field': 'id',
+            'label_field': 'name'
+        },
+        'list_delivery_notes': {
+            'key': 'delivery_notes',
+            'doctype': 'Delivery Note',
+            'id_field': 'name',
+            'label_field': 'name'
+        },
+        'get_delivery_note': {
+            'key': None,  # Root level
+            'doctype': 'Delivery Note',
+            'id_field': 'name',
+            'label_field': 'name'
+        },
+        'list_invoices': {
+            'key': 'invoices',
+            'doctype': 'Sales Invoice',
+            'id_field': 'name',
+            'label_field': 'name'
+        },
+        'get_sales_invoice': {
+            'key': None,
+            'doctype': 'Sales Invoice',
+            'id_field': 'name',
+            'label_field': 'name'
+        },
+        'get_sales_invoices': {
+            'key': None,  # Returns list at root
+            'doctype': 'Sales Invoice',
+            'id_field': 'name',
+            'label_field': 'name',
+            'is_list': True
+        },
+        'list_sales_orders': {
+            'key': 'sales_orders',
+            'doctype': 'Sales Order',
+            'id_field': 'name',
+            'label_field': 'name'
+        },
+        'list_quotations': {
+            'key': 'quotations',
+            'doctype': 'Quotation',
+            'id_field': 'name',
+            'label_field': 'name'
+        },
+        'list_customers': {
+            'key': 'customers',
+            'doctype': 'Customer',
+            'id_field': 'name',
+            'label_field': 'customer_name'
+        },
+        'get_customers': {
+            'key': None,
+            'doctype': 'Customer',
+            'id_field': 'name',
+            'label_field': 'customer_name',
+            'is_list': True
+        },
+        'get_purchase_orders': {
+            'key': None,
+            'doctype': 'Purchase Order',
+            'id_field': 'name',
+            'label_field': 'name',
+            'is_list': True
+        },
+        'get_purchase_invoices': {
+            'key': None,
+            'doctype': 'Purchase Invoice',
+            'id_field': 'name',
+            'label_field': 'name',
+            'is_list': True
+        },
+        'list_service_protocols': {
+            'key': 'service_protocols',
+            'doctype': 'Service Protocol',
+            'id_field': 'name',
+            'label_field': 'name'
+        },
+        'get_service_protocol': {
+            'key': None,
+            'doctype': 'Service Protocol',
+            'id_field': 'name',
+            'label_field': 'name'
+        },
+        'get_employees': {
+            'key': None,
+            'doctype': 'Employee',
+            'id_field': 'name',
+            'label_field': 'employee_name',
+            'is_list': True
+        },
+        'get_outstanding_invoices': {
+            'key': None,
+            'doctype': 'Sales Invoice',
+            'id_field': 'name',
+            'label_field': 'name',
+            'is_list': True
+        },
+    }
+
+    mapping = function_mappings.get(function_name)
+    if not mapping:
+        return entities
+
+    try:
+        # Handle lookup_entity specially - it has dynamic doctype
+        if function_name == 'lookup_entity':
+            best_match = response_data.get('best_match')
+            doctype = response_data.get('doctype', 'Unknown')
+            if best_match and best_match.get('id'):
+                entities.append({
+                    'id': best_match.get('id'),
+                    'doctype': doctype,
+                    'label': best_match.get('name') or best_match.get('id')
+                })
+            return entities
+
+        # Get the data to process
+        data_key = mapping.get('key')
+        if data_key:
+            data = response_data.get(data_key, [])
+        else:
+            data = response_data
+
+        # Ensure data is a list
+        if not isinstance(data, list):
+            data = [data] if data else []
+
+        # Extract entities (limit to first 10 for UI)
+        doctype = mapping.get('doctype', 'Unknown')
+        id_field = mapping.get('id_field', 'name')
+        label_field = mapping.get('label_field', 'name')
+
+        for item in data[:10]:
+            if isinstance(item, dict) and item.get(id_field):
+                entities.append({
+                    'id': item.get(id_field),
+                    'doctype': doctype,
+                    'label': item.get(label_field) or item.get(id_field)
+                })
+
+    except Exception as e:
+        logger.warning(f"Error extracting entities from {function_name}: {e}")
+
+    return entities
+
+
 def handle_tool_calls(tool_calls: List[Any], conversation: List[Dict[str, Any]], tool_usage_log: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Handle the tool calls by executing the corresponding functions and appending the results to the conversation.
@@ -235,6 +398,9 @@ def handle_tool_calls(tool_calls: List[Any], conversation: List[Dict[str, Any]],
                 tool_usage_entry['result_summary'] = "Query executed"
 
             tool_usage_entry['status'] = 'success'
+
+            # Extract fetched entities for quick access chips
+            tool_usage_entry['fetched_entities'] = extract_fetched_entities(function_name, response_data if isinstance(response_data, dict) else {})
 
         except Exception as e:
             frappe.log_error(f"Error calling function {function_name} with args {json.dumps(function_args)}: {str(e)}", "OpenAI Tool Error")
