@@ -9,7 +9,7 @@ app_license = "MIT"
 
 # Include JS and CSS files in header of desk.html
 app_include_js = [
-    "/assets/erpnext_chatgpt/js/frontend.js?v=8",
+    "/assets/erpnext_chatgpt/js/frontend.js?v=9",
     "/assets/erpnext_chatgpt/js/openai_settings.js?v=1"
 ]
 

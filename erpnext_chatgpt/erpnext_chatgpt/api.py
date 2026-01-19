@@ -863,7 +863,10 @@ def get_conversation(session_id: str) -> Dict[str, Any]:
         if doc.owner != frappe.session.user and "System Manager" not in frappe.get_roles():
             frappe.throw("You don't have permission to access this conversation")
 
-        messages = json.loads(doc.messages) if doc.messages else []
+        raw_messages = json.loads(doc.messages) if doc.messages else []
+
+        # Filter to only return user and assistant messages (no tool responses)
+        messages = extract_messages_for_storage(raw_messages)
 
         return {
             "success": True,

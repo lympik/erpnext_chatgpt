@@ -545,24 +545,41 @@ function displayConversation(conversation) {
   const conversationContainer = document.getElementById("answer");
   conversationContainer.innerHTML = "";
 
-  conversation.forEach((message, index) => {
+  let displayIndex = 0;
+  conversation.forEach((message) => {
+    // Only display user and assistant messages with actual content
+    // Skip tool messages, system messages, and messages without content
+    const role = message.role;
+    if (role !== "user" && role !== "assistant") {
+      return; // Skip tool, system, and other message types
+    }
+
+    const displayContent = message.content_display || message.content;
+    if (!displayContent || displayContent === "null") {
+      return; // Skip messages with no content
+    }
+
+    // For assistant messages, skip if it only has tool_calls (no final answer)
+    if (role === "assistant" && message.tool_calls && !displayContent) {
+      return;
+    }
+
     const messageElement = document.createElement("div");
     messageElement.className =
-      message.role === "user" ? "alert alert-primary" : "alert alert-light";
+      role === "user" ? "alert alert-primary" : "alert alert-light";
 
-    // Add the main message content (use content_display for UI, fallback to content)
-    const displayContent = message.content_display || message.content;
     let content = renderMessageContent(displayContent);
 
     // If this is an assistant message with tool usage, add a toggle button and hidden details
-    if (message.role === "assistant" && message.tool_usage && message.tool_usage.length > 0) {
+    if (role === "assistant" && message.tool_usage && message.tool_usage.length > 0) {
       console.log("Message has tool usage:", message.tool_usage);
-      const messageId = `msg-${index}`;
+      const messageId = `msg-${displayIndex}`;
       content += renderToolUsageToggle(message.tool_usage, messageId);
     }
 
     messageElement.innerHTML = content;
     conversationContainer.appendChild(messageElement);
+    displayIndex++;
   });
 
   // Scroll to bottom of conversation
