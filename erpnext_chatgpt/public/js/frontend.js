@@ -1,7 +1,9 @@
 // Wait for the DOM to be fully loaded before initializing
 document.addEventListener("DOMContentLoaded", initializeChat);
 
-let conversation = [];
+// Session-based conversation state
+let currentSessionId = null;
+let conversation = []; // Local display cache
 
 async function initializeChat() {
   await loadMarkedJs();
@@ -53,7 +55,7 @@ function createChatButton() {
   return button;
 }
 
-function openChatDialog() {
+async function openChatDialog() {
   // Check if dialog already exists
   let dialog = document.getElementById("chatDialog");
 
@@ -66,14 +68,82 @@ function openChatDialog() {
   // Show the dialog
   $(dialog).modal("show");
 
-  // Load existing conversation from localStorage if available
-  const saved = localStorage.getItem("chatConversation");
-  if (saved) {
-    conversation = JSON.parse(saved);
-    displayConversation(conversation);
+  // Load conversation
+  await loadConversation();
+}
+
+async function loadConversation() {
+  const lastSessionId = localStorage.getItem("lastAISessionId");
+
+  if (lastSessionId) {
+    // Load the last session from server
+    await loadSession(lastSessionId);
   } else {
-    // Show suggestion prompts when chat is empty
+    // No existing conversation, show welcome prompts
+    conversation = [];
     showSuggestionPrompts();
+  }
+}
+
+async function loadSession(sessionId) {
+  try {
+    const response = await frappe.call({
+      method: "erpnext_chatgpt.erpnext_chatgpt.api.get_conversation",
+      args: { session_id: sessionId }
+    });
+
+    if (response?.message?.success) {
+      currentSessionId = sessionId;
+      conversation = response.message.messages || [];
+      updateConversationTitle(response.message.title);
+
+      if (conversation.length === 0) {
+        showSuggestionPrompts();
+      } else {
+        displayConversation(conversation);
+      }
+    } else {
+      console.error("Failed to load session:", response?.message?.error);
+      // Session not found, create new one
+      await createNewConversation();
+    }
+  } catch (error) {
+    console.error("Error loading session:", error);
+    // Fall back to creating new conversation
+    await createNewConversation();
+  }
+}
+
+async function createNewConversation() {
+  try {
+    const response = await frappe.call({
+      method: "erpnext_chatgpt.erpnext_chatgpt.api.create_conversation",
+    });
+
+    if (response?.message?.success) {
+      currentSessionId = response.message.session_id;
+      localStorage.setItem("lastAISessionId", currentSessionId);
+      conversation = [];
+      updateConversationTitle("New Conversation");
+      showSuggestionPrompts();
+      console.log("Created new conversation:", currentSessionId);
+    } else {
+      console.error("Failed to create conversation:", response?.message?.error);
+      showSuggestionPrompts();
+    }
+  } catch (error) {
+    console.error("Error creating conversation:", error);
+    showSuggestionPrompts();
+  }
+}
+
+function updateConversationTitle(title) {
+  const titleElement = document.getElementById("chatDialogTitle");
+  if (titleElement) {
+    // Truncate title if too long
+    const displayTitle = title.length > 40 ? title.substring(0, 37) + "..." : title;
+    titleElement.textContent = displayTitle;
+    titleElement.title = title; // Full title on hover
   }
 }
 
@@ -85,18 +155,35 @@ function createChatDialog() {
   dialog.setAttribute("role", "dialog");
   dialog.setAttribute("aria-labelledby", "chatDialogTitle");
   dialog.innerHTML = `
-    <div class="modal-dialog" role="document">
+    <div class="modal-dialog modal-lg" role="document">
       <div class="modal-content">
         <div class="modal-header">
-          <h5 class="modal-title" id="chatDialogTitle">AI Assistant</h5>
+          <div class="d-flex align-items-center">
+            <button type="button" class="btn btn-sm btn-outline-secondary mr-2" onclick="window.showConversationList()" title="View conversations">
+              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
+            </button>
+            <h5 class="modal-title mb-0" id="chatDialogTitle">AI Assistant</h5>
+          </div>
           <div>
-            <button type="button" class="btn btn-sm btn-outline-secondary mr-2" onclick="window.clearConversation()">Clear Chat</button>
+            <button type="button" class="btn btn-sm btn-outline-primary mr-2" onclick="window.startNewConversation()" title="New conversation">
+              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+              New
+            </button>
             <button type="button" class="close" data-dismiss="modal" aria-label="Close">
               <span aria-hidden="true">&times;</span>
             </button>
           </div>
         </div>
-        <div class="modal-body">
+        <div class="modal-body p-0">
+          <div id="conversationListPanel" style="display: none; position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: white; z-index: 10; overflow-y: auto;">
+            <div class="p-3 border-bottom d-flex justify-content-between align-items-center">
+              <h6 class="mb-0">Conversations</h6>
+              <button type="button" class="btn btn-sm btn-outline-secondary" onclick="window.hideConversationList()">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+              </button>
+            </div>
+            <div id="conversationListContent" class="p-2"></div>
+          </div>
           <div id="answer" class="p-3" style="background: #f4f4f4; min-height: 400px; max-height: 400px; overflow-y: auto;"></div>
         </div>
         <div class="modal-footer d-flex align-items-center" style="flex-wrap:nowrap;">
@@ -134,15 +221,135 @@ window.handleAskButtonClick = function() {
   askQuestion(question);
 }
 
-// Make clearConversation globally available
-window.clearConversation = function() {
-  conversation = [];
-  localStorage.removeItem("chatConversation");
-  const answerDiv = document.getElementById("answer");
-  if (answerDiv) {
-    answerDiv.innerHTML = "";
+// Make startNewConversation globally available
+window.startNewConversation = async function() {
+  await createNewConversation();
+}
+
+// Make showConversationList globally available
+window.showConversationList = async function() {
+  const panel = document.getElementById("conversationListPanel");
+  const content = document.getElementById("conversationListContent");
+
+  if (panel && content) {
+    panel.style.display = "block";
+    content.innerHTML = '<div class="text-center p-3"><span class="spinner-border spinner-border-sm" role="status"></span> Loading...</div>';
+
+    try {
+      const response = await frappe.call({
+        method: "erpnext_chatgpt.erpnext_chatgpt.api.list_conversations",
+        args: { status: "Active", limit: 20 }
+      });
+
+      if (response?.message?.success) {
+        renderConversationList(response.message.conversations);
+      } else {
+        content.innerHTML = '<div class="alert alert-warning m-2">Failed to load conversations</div>';
+      }
+    } catch (error) {
+      console.error("Error loading conversations:", error);
+      content.innerHTML = '<div class="alert alert-danger m-2">Error loading conversations</div>';
+    }
   }
-  showSuggestionPrompts();
+}
+
+// Make hideConversationList globally available
+window.hideConversationList = function() {
+  const panel = document.getElementById("conversationListPanel");
+  if (panel) {
+    panel.style.display = "none";
+  }
+}
+
+function renderConversationList(conversations) {
+  const content = document.getElementById("conversationListContent");
+  if (!content) return;
+
+  if (conversations.length === 0) {
+    content.innerHTML = '<div class="text-muted text-center p-3">No conversations yet</div>';
+    return;
+  }
+
+  let html = '<div class="list-group list-group-flush">';
+  conversations.forEach(conv => {
+    const isActive = conv.name === currentSessionId;
+    const lastMessageTime = conv.last_message_at ? formatRelativeTime(conv.last_message_at) : 'Just created';
+
+    html += `
+      <a href="#" class="list-group-item list-group-item-action ${isActive ? 'active' : ''}"
+         onclick="window.switchConversation('${conv.name}')" style="cursor: pointer;">
+        <div class="d-flex w-100 justify-content-between align-items-start">
+          <div style="overflow: hidden;">
+            <h6 class="mb-1 text-truncate" style="max-width: 280px;">${escapeHTML(conv.title || 'Untitled')}</h6>
+            <small class="${isActive ? 'text-white-50' : 'text-muted'}">${conv.message_count || 0} messages</small>
+          </div>
+          <div class="text-right" style="white-space: nowrap;">
+            <small class="${isActive ? 'text-white-50' : 'text-muted'}">${lastMessageTime}</small>
+            <br>
+            <button class="btn btn-sm btn-link p-0 ${isActive ? 'text-white' : ''}" onclick="event.stopPropagation(); window.archiveConversation('${conv.name}')" title="Archive">
+              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+            </button>
+          </div>
+        </div>
+      </a>
+    `;
+  });
+  html += '</div>';
+
+  content.innerHTML = html;
+}
+
+function formatRelativeTime(dateStr) {
+  const date = new Date(dateStr);
+  const now = new Date();
+  const diffMs = now - date;
+  const diffMins = Math.floor(diffMs / 60000);
+  const diffHours = Math.floor(diffMs / 3600000);
+  const diffDays = Math.floor(diffMs / 86400000);
+
+  if (diffMins < 1) return 'Just now';
+  if (diffMins < 60) return `${diffMins}m ago`;
+  if (diffHours < 24) return `${diffHours}h ago`;
+  if (diffDays < 7) return `${diffDays}d ago`;
+  return date.toLocaleDateString();
+}
+
+// Make switchConversation globally available
+window.switchConversation = async function(sessionId) {
+  window.hideConversationList();
+  await loadSession(sessionId);
+  localStorage.setItem("lastAISessionId", sessionId);
+}
+
+// Make archiveConversation globally available
+window.archiveConversation = async function(sessionId) {
+  if (!confirm("Archive this conversation?")) return;
+
+  try {
+    const response = await frappe.call({
+      method: "erpnext_chatgpt.erpnext_chatgpt.api.archive_conversation",
+      args: { session_id: sessionId }
+    });
+
+    if (response?.message?.success) {
+      // Refresh the list
+      if (sessionId === currentSessionId) {
+        // If we archived the current conversation, start a new one
+        await createNewConversation();
+      }
+      window.showConversationList();
+    } else {
+      frappe.msgprint("Failed to archive conversation");
+    }
+  } catch (error) {
+    console.error("Error archiving conversation:", error);
+    frappe.msgprint("Error archiving conversation");
+  }
+}
+
+// Legacy clearConversation - now starts a new conversation
+window.clearConversation = async function() {
+  await createNewConversation();
 }
 
 function showSuggestionPrompts() {
@@ -214,11 +421,17 @@ async function askQuestion(question) {
   askButton.disabled = true;
   askButton.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> Processing...';
 
-  // Add user message to conversation
+  // Add user message to local display
   conversation.push({ role: "user", content: question });
   displayConversation(conversation);
 
   try {
+    // Ensure we have a session ID
+    if (!currentSessionId) {
+      await createNewConversation();
+    }
+
+    // Send only session_id + message to server (server handles full history)
     const response = await fetch(
       "/api/method/erpnext_chatgpt.erpnext_chatgpt.api.ask_openai_question",
       {
@@ -227,7 +440,10 @@ async function askQuestion(question) {
           "Content-Type": "application/json",
           "X-Frappe-CSRF-Token": frappe.csrf_token,
         },
-        body: JSON.stringify({ conversation }),
+        body: JSON.stringify({
+          session_id: currentSessionId,
+          message: question
+        }),
       }
     );
 
@@ -240,15 +456,28 @@ async function askQuestion(question) {
 
     const parsedMessage = parseResponseMessage(data);
     console.log("Parsed message with tool usage:", parsedMessage.tool_usage);
+
+    // Update local conversation cache
     conversation.push({
       role: "assistant",
       content: parsedMessage.content,
+      content_display: parsedMessage.content_display,
       tool_usage: parsedMessage.tool_usage
     });
 
-    // Save conversation to localStorage
-    localStorage.setItem("chatConversation", JSON.stringify(conversation));
+    // Update session ID if returned (in case it was created during the call)
+    if (data.message?.session_id) {
+      currentSessionId = data.message.session_id;
+      localStorage.setItem("lastAISessionId", currentSessionId);
+    }
+
     displayConversation(conversation);
+
+    // Update title after first message
+    if (conversation.filter(m => m.role === "user").length === 1) {
+      updateConversationTitle(question.length > 40 ? question.substring(0, 37) + "..." : question);
+    }
+
   } catch (error) {
     console.error("Error in askQuestion:", error);
     // Remove the user message if there was an error
@@ -272,7 +501,7 @@ async function askQuestion(question) {
 function parseResponseMessage(response) {
   // If the response is null or undefined, return an error message
   if (response == null) {
-    return { content: "No response received.", tool_usage: [] };
+    return { content: "No response received.", content_display: "No response received.", tool_usage: [] };
   }
 
   // If the response is an object with a message property, use that
@@ -283,12 +512,15 @@ function parseResponseMessage(response) {
 
   // If the message is a string, return it directly
   if (typeof message === "string") {
-    return { content: message, tool_usage: tool_usage };
+    return { content: message, content_display: message, tool_usage: tool_usage };
   }
 
-  // If the message is an object with a content property, return that
+  // If the message is an object with content property
   if (message && typeof message === "object" && "content" in message) {
-    return { content: message.content, tool_usage: tool_usage };
+    // Use content_display for UI if available, otherwise strip HTML comments from content
+    const content = message.content || "";
+    const content_display = message.content_display || content.replace(/\n\n<!--[\s\S]*?-->/g, "");
+    return { content: content, content_display: content_display, tool_usage: tool_usage };
   }
 
   // If the message is an array, try to find a content item
@@ -300,12 +532,13 @@ function parseResponseMessage(response) {
     );
     if (contentItem) {
       const content = Array.isArray(contentItem) ? contentItem[1] : contentItem.content;
-      return { content: content, tool_usage: tool_usage };
+      return { content: content, content_display: content, tool_usage: tool_usage };
     }
   }
 
   // If we can't parse the message in any known format, return the stringified version
-  return { content: JSON.stringify(message, null, 2), tool_usage: tool_usage };
+  const stringified = JSON.stringify(message, null, 2);
+  return { content: stringified, content_display: stringified, tool_usage: tool_usage };
 }
 
 function displayConversation(conversation) {
@@ -317,8 +550,9 @@ function displayConversation(conversation) {
     messageElement.className =
       message.role === "user" ? "alert alert-primary" : "alert alert-light";
 
-    // Add the main message content
-    let content = renderMessageContent(message.content);
+    // Add the main message content (use content_display for UI, fallback to content)
+    const displayContent = message.content_display || message.content;
+    let content = renderMessageContent(displayContent);
 
     // If this is an assistant message with tool usage, add a toggle button and hidden details
     if (message.role === "assistant" && message.tool_usage && message.tool_usage.length > 0) {

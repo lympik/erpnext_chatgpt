@@ -1,0 +1,88 @@
+{
+  "doctype": "DocType",
+  "name": "AI Conversation",
+  "module": "Erpnext Chatgpt",
+  "custom": 0,
+  "autoname": "hash",
+  "naming_rule": "Random",
+  "icon": "fa fa-comments",
+  "track_changes": 0,
+  "fields": [
+    {
+      "fieldname": "title",
+      "fieldtype": "Data",
+      "label": "Title",
+      "description": "Auto-generated from the first user message"
+    },
+    {
+      "fieldname": "user",
+      "fieldtype": "Link",
+      "label": "User",
+      "options": "User",
+      "reqd": 1,
+      "set_only_once": 1,
+      "default": "__user"
+    },
+    {
+      "fieldname": "status",
+      "fieldtype": "Select",
+      "label": "Status",
+      "options": "Active\nArchived",
+      "default": "Active"
+    },
+    {
+      "fieldname": "column_break_1",
+      "fieldtype": "Column Break"
+    },
+    {
+      "fieldname": "message_count",
+      "fieldtype": "Int",
+      "label": "Message Count",
+      "read_only": 1,
+      "default": 0
+    },
+    {
+      "fieldname": "last_message_at",
+      "fieldtype": "Datetime",
+      "label": "Last Message At",
+      "read_only": 1
+    },
+    {
+      "fieldname": "model_used",
+      "fieldtype": "Data",
+      "label": "Model Used",
+      "read_only": 1
+    },
+    {
+      "fieldname": "section_break_messages",
+      "fieldtype": "Section Break",
+      "label": "Conversation Data"
+    },
+    {
+      "fieldname": "messages",
+      "fieldtype": "JSON",
+      "label": "Messages",
+      "description": "Full OpenAI conversation array stored as JSON"
+    }
+  ],
+  "permissions": [
+    {
+      "role": "System Manager",
+      "read": 1,
+      "write": 1,
+      "create": 1,
+      "delete": 1,
+      "if_owner": 0
+    },
+    {
+      "role": "All",
+      "read": 1,
+      "write": 1,
+      "create": 1,
+      "delete": 0,
+      "if_owner": 1
+    }
+  ],
+  "sort_field": "last_message_at",
+  "sort_order": "DESC"
+}

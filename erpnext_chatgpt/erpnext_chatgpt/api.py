@@ -451,17 +451,42 @@ def trim_conversation_to_token_limit(conversation: List[Dict[str, Any]], token_l
     return conversation
 
 @frappe.whitelist()
-def ask_openai_question(conversation: List[Dict[str, Any]]) -> Dict[str, Any]:
+def ask_openai_question(session_id: str, message: str) -> Dict[str, Any]:
     """
     Ask a question to the OpenAI model and handle the response.
     Track all tool usage for transparency.
 
-    :param conversation: List of conversation messages.
+    :param session_id: The conversation session ID
+    :param message: The user's new message
     :return: The response from OpenAI with tool usage information.
     """
     try:
+        if not session_id or not message:
+            return {"error": "session_id and message are required", "tool_usage": []}
+
         client = get_openai_client()
         tool_usage_log = []
+
+        # Load conversation from database
+        try:
+            session_doc = frappe.get_doc("AI Conversation", session_id)
+
+            # Check permission
+            if session_doc.user != frappe.session.user and "System Manager" not in frappe.get_roles():
+                frappe.throw("You don't have permission to access this conversation")
+
+            # Load existing messages
+            conversation = json.loads(session_doc.messages) if session_doc.messages else []
+
+            # Add the new user message
+            conversation.append({"role": "user", "content": message})
+
+            # Auto-generate title from first user message if title is still default
+            if session_doc.title == "New Conversation" and message:
+                session_doc.title = message[:50] + "..." if len(message) > 50 else message
+
+        except frappe.DoesNotExistError:
+            return {"error": "Conversation session not found", "tool_usage": []}
 
         # Add system instructions as the initial message if not present
         if not conversation or conversation[0].get("role") != "system":
@@ -517,13 +542,50 @@ def ask_openai_question(conversation: List[Dict[str, Any]]) -> Dict[str, Any]:
                         message = final_args.get("message", "")
                         message = auto_link_document_ids(message)
 
+                        # Build context summary for conversation continuity
+                        # This gets embedded in the message so the model remembers what was searched
+                        context_parts = []
+                        for tool_entry in tool_usage_log:
+                            tool_name = tool_entry.get("tool_name", "")
+                            params = tool_entry.get("parameters", {})
+                            if params and tool_name != "final_answer":
+                                param_str = ", ".join(f"{k}={v}" for k, v in params.items() if v is not None)
+                                context_parts.append(f"{tool_name}({param_str})")
+
+                        # Append context as hidden metadata for future turns
+                        if context_parts:
+                            context_note = "\n\n<!-- CONTEXT: " + " | ".join(context_parts) + " -->"
+                            message_with_context = message + context_note
+                        else:
+                            message_with_context = message
+
+                        # Add assistant response to conversation
+                        assistant_message = {
+                            "role": "assistant",
+                            "content": message_with_context,
+                            "content_display": message,
+                            "tool_usage": tool_usage_log
+                        }
+                        conversation.append(assistant_message)
+
+                        # Save conversation to database if in session mode
+                        if session_doc:
+                            # Remove system message before saving (it's added fresh each time)
+                            messages_to_save = [m for m in conversation if m.get("role") != "system"]
+                            session_doc.messages = json.dumps(messages_to_save)
+                            session_doc.model_used = model
+                            session_doc.save(ignore_permissions=False)
+                            frappe.db.commit()
+
                         # Return the final answer in the expected format
                         return {
                             "role": "assistant",
-                            "content": message,
+                            "content": message_with_context,
+                            "content_display": message,  # Clean version for UI
                             "tool_usage": tool_usage_log,
                             "summary": final_args.get("summary"),
-                            "iterations": iteration
+                            "iterations": iteration,
+                            "session_id": session_doc.name if session_doc else None
                         }
                     except json.JSONDecodeError as e:
                         logger.error(f"Failed to parse final_answer arguments: {e}")
@@ -531,7 +593,8 @@ def ask_openai_question(conversation: List[Dict[str, Any]]) -> Dict[str, Any]:
                             "role": "assistant",
                             "content": "I encountered an error formatting my response.",
                             "tool_usage": tool_usage_log,
-                            "error": str(e)
+                            "error": str(e),
+                            "session_id": session_doc.name if session_doc else None
                         }
 
             # No final_answer yet - handle the tool calls and continue
@@ -545,15 +608,32 @@ def ask_openai_question(conversation: List[Dict[str, Any]]) -> Dict[str, Any]:
 
         # If we hit max iterations, force a response
         logger.warning(f"Hit max iterations ({max_iterations}) without final_answer")
+
+        # Save conversation state even on max iterations
+        error_message = "I was unable to complete the request within the allowed number of steps. Please try a simpler query."
+        conversation.append({
+            "role": "assistant",
+            "content": error_message,
+            "tool_usage": tool_usage_log
+        })
+
+        if session_doc:
+            messages_to_save = [m for m in conversation if m.get("role") != "system"]
+            session_doc.messages = json.dumps(messages_to_save)
+            session_doc.model_used = model
+            session_doc.save(ignore_permissions=False)
+            frappe.db.commit()
+
         return {
             "role": "assistant",
-            "content": "I was unable to complete the request within the allowed number of steps. Please try a simpler query.",
+            "content": error_message,
             "tool_usage": tool_usage_log,
-            "error": "max_iterations_reached"
+            "error": "max_iterations_reached",
+            "session_id": session_doc.name if session_doc else None
         }
     except Exception as e:
         frappe.log_error(message=str(e), title="OpenAI API Error")
-        return {"error": str(e), "tool_usage": []}
+        return {"error": str(e), "tool_usage": [], "session_id": session_id if session_id else None}
 
 @frappe.whitelist()
 def test_openai_api_key(api_key: str) -> bool:
@@ -647,3 +727,196 @@ def check_openai_key_and_role() -> Dict[str, Any]:
     :return: Dictionary indicating to always show the button.
     """
     return {"show_button": True}
+
+
+# =============================================================================
+# Conversation Management API Endpoints
+# =============================================================================
+
+@frappe.whitelist()
+def create_conversation(title: str = None) -> Dict[str, Any]:
+    """
+    Create a new AI conversation session.
+
+    :param title: Optional title for the conversation
+    :return: Dictionary with session_id and conversation details
+    """
+    try:
+        model, _ = get_model_settings()
+
+        doc = frappe.get_doc({
+            "doctype": "AI Conversation",
+            "title": title or "New Conversation",
+            "user": frappe.session.user,
+            "status": "Active",
+            "messages": json.dumps([]),
+            "message_count": 0,
+            "model_used": model
+        })
+        doc.insert(ignore_permissions=False)
+        frappe.db.commit()
+
+        return {
+            "success": True,
+            "session_id": doc.name,
+            "title": doc.title,
+            "created_at": str(doc.creation),
+            "model_used": doc.model_used
+        }
+    except Exception as e:
+        frappe.log_error(message=str(e), title="Create Conversation Error")
+        return {"success": False, "error": str(e)}
+
+
+@frappe.whitelist()
+def list_conversations(status: str = "Active", limit: int = 20, offset: int = 0) -> Dict[str, Any]:
+    """
+    List user's AI conversations.
+
+    :param status: Filter by status (Active, Archived, or None for all)
+    :param limit: Number of conversations to return
+    :param offset: Number of conversations to skip
+    :return: Dictionary with conversations list and pagination info
+    """
+    try:
+        filters = {"user": frappe.session.user}
+        if status:
+            filters["status"] = status
+
+        conversations = frappe.db.get_all(
+            "AI Conversation",
+            filters=filters,
+            fields=["name", "title", "status", "message_count", "last_message_at", "model_used", "creation"],
+            order_by="last_message_at desc",
+            limit_page_length=limit,
+            limit_start=offset
+        )
+
+        total_count = frappe.db.count("AI Conversation", filters=filters)
+
+        return {
+            "success": True,
+            "conversations": conversations,
+            "total_count": total_count,
+            "limit": limit,
+            "offset": offset
+        }
+    except Exception as e:
+        frappe.log_error(message=str(e), title="List Conversations Error")
+        return {"success": False, "error": str(e)}
+
+
+@frappe.whitelist()
+def get_conversation(session_id: str) -> Dict[str, Any]:
+    """
+    Get full conversation history by session ID.
+
+    :param session_id: The conversation session ID
+    :return: Dictionary with conversation details and messages
+    """
+    try:
+        doc = frappe.get_doc("AI Conversation", session_id)
+
+        # Check permission
+        if doc.user != frappe.session.user and "System Manager" not in frappe.get_roles():
+            frappe.throw("You don't have permission to access this conversation")
+
+        messages = json.loads(doc.messages) if doc.messages else []
+
+        return {
+            "success": True,
+            "session_id": doc.name,
+            "title": doc.title,
+            "status": doc.status,
+            "messages": messages,
+            "message_count": doc.message_count,
+            "last_message_at": str(doc.last_message_at) if doc.last_message_at else None,
+            "model_used": doc.model_used,
+            "created_at": str(doc.creation)
+        }
+    except frappe.DoesNotExistError:
+        return {"success": False, "error": "Conversation not found"}
+    except Exception as e:
+        frappe.log_error(message=str(e), title="Get Conversation Error")
+        return {"success": False, "error": str(e)}
+
+
+@frappe.whitelist()
+def update_conversation_title(session_id: str, title: str) -> Dict[str, Any]:
+    """
+    Update the title of a conversation.
+
+    :param session_id: The conversation session ID
+    :param title: New title for the conversation
+    :return: Dictionary with success status
+    """
+    try:
+        doc = frappe.get_doc("AI Conversation", session_id)
+
+        # Check permission
+        if doc.user != frappe.session.user and "System Manager" not in frappe.get_roles():
+            frappe.throw("You don't have permission to modify this conversation")
+
+        doc.title = title
+        doc.save(ignore_permissions=False)
+        frappe.db.commit()
+
+        return {"success": True, "session_id": session_id, "title": title}
+    except frappe.DoesNotExistError:
+        return {"success": False, "error": "Conversation not found"}
+    except Exception as e:
+        frappe.log_error(message=str(e), title="Update Conversation Title Error")
+        return {"success": False, "error": str(e)}
+
+
+@frappe.whitelist()
+def archive_conversation(session_id: str) -> Dict[str, Any]:
+    """
+    Archive a conversation.
+
+    :param session_id: The conversation session ID
+    :return: Dictionary with success status
+    """
+    try:
+        doc = frappe.get_doc("AI Conversation", session_id)
+
+        # Check permission
+        if doc.user != frappe.session.user and "System Manager" not in frappe.get_roles():
+            frappe.throw("You don't have permission to modify this conversation")
+
+        doc.status = "Archived"
+        doc.save(ignore_permissions=False)
+        frappe.db.commit()
+
+        return {"success": True, "session_id": session_id, "status": "Archived"}
+    except frappe.DoesNotExistError:
+        return {"success": False, "error": "Conversation not found"}
+    except Exception as e:
+        frappe.log_error(message=str(e), title="Archive Conversation Error")
+        return {"success": False, "error": str(e)}
+
+
+@frappe.whitelist()
+def delete_conversation(session_id: str) -> Dict[str, Any]:
+    """
+    Delete a conversation (System Manager only, or own conversation).
+
+    :param session_id: The conversation session ID
+    :return: Dictionary with success status
+    """
+    try:
+        doc = frappe.get_doc("AI Conversation", session_id)
+
+        # Check permission - only System Manager can delete others' conversations
+        if doc.user != frappe.session.user and "System Manager" not in frappe.get_roles():
+            frappe.throw("You don't have permission to delete this conversation")
+
+        doc.delete(ignore_permissions=False)
+        frappe.db.commit()
+
+        return {"success": True, "session_id": session_id, "deleted": True}
+    except frappe.DoesNotExistError:
+        return {"success": False, "error": "Conversation not found"}
+    except Exception as e:
+        frappe.log_error(message=str(e), title="Delete Conversation Error")
+        return {"success": False, "error": str(e)}
