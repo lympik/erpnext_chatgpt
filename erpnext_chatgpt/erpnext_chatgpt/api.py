@@ -102,6 +102,7 @@ def get_system_instructions():
     user_full_name = frappe.get_value("User", current_user, "full_name") or current_user
     user_roles = frappe.get_roles(current_user)
     company = frappe.defaults.get_user_default("company") or frappe.defaults.get_global_default("company")
+    current_datetime = frappe.utils.now()
 
     # Get custom system instructions from settings
     custom_instructions = frappe.db.get_single_value("OpenAI Settings", "system_instructions")
@@ -110,15 +111,29 @@ def get_system_instructions():
     if not custom_instructions or custom_instructions.strip() == "":
         return "No system instructions are currently configured. Please go to the OpenAI Settings page to set up custom system instructions for the AI assistant."
 
+    # Build placeholder values - support multiple naming conventions
+    placeholder_values = {
+        # User info - multiple naming conventions
+        'user_name': user_full_name,
+        'user_full_name': user_full_name,
+        'user_email': current_user,
+        'current_user': current_user,
+        'user_roles': ', '.join(user_roles) if user_roles else 'No roles assigned',
+
+        # Company
+        'company': company if company else 'ERPNext',
+
+        # Date/time - multiple naming conventions
+        'current_datetime': current_datetime,
+        'current_date': frappe.utils.today(),
+        'current_time': frappe.utils.nowtime(),
+        'now': current_datetime,
+        'today': frappe.utils.today(),
+    }
+
     # Replace placeholders with actual values
     try:
-        system_instructions = custom_instructions.format(
-            user_name=user_full_name,
-            user_email=current_user,
-            user_roles=', '.join(user_roles) if user_roles else 'No roles assigned',
-            company=company if company else 'Not set',
-            current_datetime=frappe.utils.now()
-        )
+        system_instructions = custom_instructions.format(**placeholder_values)
     except KeyError as e:
         # Handle case where placeholder is used incorrectly
         logger.warning(f"Invalid placeholder in system instructions: {e}")
@@ -471,8 +486,8 @@ def ask_openai_question(session_id: str, message: str) -> Dict[str, Any]:
         try:
             session_doc = frappe.get_doc("AI Conversation", session_id)
 
-            # Check permission
-            if session_doc.user != frappe.session.user and "System Manager" not in frappe.get_roles():
+            # Check permission using owner field
+            if session_doc.owner != frappe.session.user and "System Manager" not in frappe.get_roles():
                 frappe.throw("You don't have permission to access this conversation")
 
             # Load existing messages
@@ -747,7 +762,6 @@ def create_conversation(title: str = None) -> Dict[str, Any]:
         doc = frappe.get_doc({
             "doctype": "AI Conversation",
             "title": title or "New Conversation",
-            "user": frappe.session.user,
             "status": "Active",
             "messages": json.dumps([]),
             "message_count": 0,
@@ -779,15 +793,20 @@ def list_conversations(status: str = "Active", limit: int = 20, offset: int = 0)
     :return: Dictionary with conversations list and pagination info
     """
     try:
-        filters = {"user": frappe.session.user}
+        # Ensure limit and offset are integers
+        limit = int(limit) if limit else 20
+        offset = int(offset) if offset else 0
+
+        filters = {"owner": frappe.session.user}
         if status:
             filters["status"] = status
 
+        # Order by modified (always set) instead of last_message_at (can be NULL)
         conversations = frappe.db.get_all(
             "AI Conversation",
             filters=filters,
-            fields=["name", "title", "status", "message_count", "last_message_at", "model_used", "creation"],
-            order_by="last_message_at desc",
+            fields=["name", "title", "status", "message_count", "last_message_at", "model_used", "creation", "modified"],
+            order_by="modified desc",
             limit_page_length=limit,
             limit_start=offset
         )
@@ -817,8 +836,8 @@ def get_conversation(session_id: str) -> Dict[str, Any]:
     try:
         doc = frappe.get_doc("AI Conversation", session_id)
 
-        # Check permission
-        if doc.user != frappe.session.user and "System Manager" not in frappe.get_roles():
+        # Check permission using owner field (set automatically by Frappe)
+        if doc.owner != frappe.session.user and "System Manager" not in frappe.get_roles():
             frappe.throw("You don't have permission to access this conversation")
 
         messages = json.loads(doc.messages) if doc.messages else []
@@ -853,8 +872,8 @@ def update_conversation_title(session_id: str, title: str) -> Dict[str, Any]:
     try:
         doc = frappe.get_doc("AI Conversation", session_id)
 
-        # Check permission
-        if doc.user != frappe.session.user and "System Manager" not in frappe.get_roles():
+        # Check permission using owner field
+        if doc.owner != frappe.session.user and "System Manager" not in frappe.get_roles():
             frappe.throw("You don't have permission to modify this conversation")
 
         doc.title = title
@@ -880,8 +899,8 @@ def archive_conversation(session_id: str) -> Dict[str, Any]:
     try:
         doc = frappe.get_doc("AI Conversation", session_id)
 
-        # Check permission
-        if doc.user != frappe.session.user and "System Manager" not in frappe.get_roles():
+        # Check permission using owner field
+        if doc.owner != frappe.session.user and "System Manager" not in frappe.get_roles():
             frappe.throw("You don't have permission to modify this conversation")
 
         doc.status = "Archived"
@@ -907,8 +926,8 @@ def delete_conversation(session_id: str) -> Dict[str, Any]:
     try:
         doc = frappe.get_doc("AI Conversation", session_id)
 
-        # Check permission - only System Manager can delete others' conversations
-        if doc.user != frappe.session.user and "System Manager" not in frappe.get_roles():
+        # Check permission using owner field - only System Manager can delete others' conversations
+        if doc.owner != frappe.session.user and "System Manager" not in frappe.get_roles():
             frappe.throw("You don't have permission to delete this conversation")
 
         doc.delete(ignore_permissions=False)
