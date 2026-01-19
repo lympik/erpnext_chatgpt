@@ -134,7 +134,7 @@ def get_model_settings():
 
     # Use defaults if not set
     if not model:
-        model = "gpt-3.5-turbo"
+        model = "gpt-4o-mini"
     if not max_tokens:
         max_tokens = 8000
 
@@ -591,7 +591,7 @@ def get_available_models() -> List[str]:
         # Filter for chat models
         chat_models = []
         for model in models:
-            if any(prefix in model.id for prefix in ["gpt-3.5", "gpt-4"]):
+            if any(prefix in model.id for prefix in ["gpt-3.5", "gpt-4", "gpt-5"]):
                 chat_models.append(model.id)
 
         # Sort models for better display
@@ -600,7 +600,7 @@ def get_available_models() -> List[str]:
     except Exception as e:
         frappe.log_error(str(e), "Failed to fetch available models")
         # Return default models if API call fails
-        return ["gpt-3.5-turbo", "gpt-3.5-turbo-16k", "gpt-4", "gpt-4-turbo", "gpt-4o", "gpt-4o-mini"]
+        return ["gpt-4o-mini", "gpt-4o", "gpt-4.1", "gpt-4.1-mini", "gpt-5-mini", "gpt-5.1", "gpt-5.2", "gpt-3.5-turbo", "gpt-4", "gpt-4-turbo"]
 
 @frappe.whitelist()
 def test_connection() -> Dict[str, Any]:

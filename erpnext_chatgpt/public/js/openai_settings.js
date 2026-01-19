@@ -28,13 +28,15 @@ frappe.ui.form.on("OpenAI Settings", {
     if (frm.fields_dict.model) {
       frm.set_df_property("model", "description",
         "<b>Model Guide:</b><br>" +
-        "• <b>gpt-3.5-turbo</b>: Fast, cost-effective, good for most tasks<br>" +
-        "• <b>gpt-3.5-turbo-16k</b>: Same as above but with larger context window<br>" +
-        "• <b>gpt-4</b>: Most capable, best for complex reasoning<br>" +
-        "• <b>gpt-4-turbo</b>: Latest GPT-4 with vision capabilities<br>" +
-        "• <b>gpt-4o</b>: Optimized GPT-4, faster responses<br>" +
-        "• <b>gpt-4o-mini</b>: Smaller, faster version of GPT-4o<br>" +
-        "<br><i>Note: GPT-4 models require API access. Check your OpenAI account for availability.</i>"
+        "• <b>gpt-4o-mini</b>: Best value - cheap, fast, 128k context (recommended)<br>" +
+        "• <b>gpt-4o</b>: Fast GPT-4 class, 128k context<br>" +
+        "• <b>gpt-4.1</b>: Excellent for coding tasks, 1M context<br>" +
+        "• <b>gpt-4.1-mini</b>: Faster/cheaper coding model, 1M context<br>" +
+        "• <b>gpt-5-mini</b>: Fast reasoning model, great balance<br>" +
+        "• <b>gpt-5.1</b>: Advanced reasoning model<br>" +
+        "• <b>gpt-5.2</b>: Latest flagship, best quality<br>" +
+        "• <b>gpt-3.5-turbo</b>: Legacy, 8k context (not recommended)<br>" +
+        "<br><i>Note: GPT-5 models may require higher API tier.</i>"
       );
     }
 
@@ -59,12 +61,16 @@ frappe.ui.form.on("OpenAI Settings", {
   model: function(frm) {
     // Show cost indication when model changes
     const costInfo = {
-      "gpt-3.5-turbo": "Low cost",
-      "gpt-3.5-turbo-16k": "Low cost, larger context",
-      "gpt-4": "Higher cost, best quality",
-      "gpt-4-turbo": "Higher cost, latest features",
-      "gpt-4o": "Moderate cost, optimized",
-      "gpt-4o-mini": "Lower cost GPT-4"
+      "gpt-4o-mini": "Low cost, 128k context (recommended)",
+      "gpt-4o": "Moderate cost, 128k context",
+      "gpt-4.1": "Moderate cost, 1M context, great for coding",
+      "gpt-4.1-mini": "Low cost, 1M context",
+      "gpt-5-mini": "Moderate cost, fast reasoning",
+      "gpt-5.1": "Higher cost, advanced reasoning",
+      "gpt-5.2": "Premium cost, flagship model",
+      "gpt-3.5-turbo": "Legacy, 8k context only",
+      "gpt-4": "Legacy, 8k context only",
+      "gpt-4-turbo": "Moderate cost, 128k context"
     };
 
     if (frm.doc.model && costInfo[frm.doc.model]) {

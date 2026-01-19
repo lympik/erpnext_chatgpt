@@ -16,10 +16,10 @@
       "fieldname": "model",
       "fieldtype": "Select",
       "label": "Model",
-      "options": "gpt-3.5-turbo\ngpt-3.5-turbo-16k\ngpt-4\ngpt-4-turbo\ngpt-4o\ngpt-4o-mini",
-      "default": "gpt-3.5-turbo",
+      "options": "gpt-4o-mini\ngpt-4o\ngpt-4.1\ngpt-4.1-mini\ngpt-5-mini\ngpt-5.1\ngpt-5.2\ngpt-3.5-turbo\ngpt-4\ngpt-4-turbo",
+      "default": "gpt-4o-mini",
       "reqd": 1,
-      "description": "Select the OpenAI model to use. GPT-3.5-turbo is most cost-effective, GPT-4 models provide better quality."
+      "description": "Select the OpenAI model to use. GPT-4o-mini recommended for balance of cost and capability. GPT-5.2 is the latest flagship model."
     },
     {
       "fieldname": "max_tokens",
