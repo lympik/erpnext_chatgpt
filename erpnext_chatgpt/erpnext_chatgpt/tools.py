@@ -471,12 +471,19 @@ def list_invoices(
     elif end_date:
         filters['posting_date'] = ['<=', end_date]
 
-    if min_amount and max_amount:
-        filters['grand_total'] = ['between', [min_amount, max_amount]]
-    elif min_amount:
-        filters['grand_total'] = ['>=', min_amount]
-    elif max_amount:
-        filters['grand_total'] = ['<=', max_amount]
+    # Handle amount filters with explicit None checks and type conversion
+    if min_amount is not None and max_amount is not None:
+        min_val = float(min_amount)
+        max_val = float(max_amount)
+        if min_val == max_val:
+            # Use equality when min and max are the same to avoid Frappe between filter edge case
+            filters['grand_total'] = min_val
+        else:
+            filters['grand_total'] = ['between', [min_val, max_val]]
+    elif min_amount is not None:
+        filters['grand_total'] = ['>=', float(min_amount)]
+    elif max_amount is not None:
+        filters['grand_total'] = ['<=', float(max_amount)]
 
     if is_paid is not None:
         if is_paid:
@@ -1109,13 +1116,18 @@ def list_quotations(
     elif valid_till_end:
         filters['valid_till'] = ['<=', valid_till_end]
 
-    # Amount filters
-    if min_amount and max_amount:
-        filters['grand_total'] = ['between', [min_amount, max_amount]]
-    elif min_amount:
-        filters['grand_total'] = ['>=', min_amount]
-    elif max_amount:
-        filters['grand_total'] = ['<=', max_amount]
+    # Amount filters - use explicit None checks and type conversion
+    if min_amount is not None and max_amount is not None:
+        min_val = float(min_amount)
+        max_val = float(max_amount)
+        if min_val == max_val:
+            filters['grand_total'] = min_val
+        else:
+            filters['grand_total'] = ['between', [min_val, max_val]]
+    elif min_amount is not None:
+        filters['grand_total'] = ['>=', float(min_amount)]
+    elif max_amount is not None:
+        filters['grand_total'] = ['<=', float(max_amount)]
 
     # Validate sort_by field
     valid_sort_fields = ['name', 'transaction_date', 'valid_till', 'grand_total',
@@ -1283,13 +1295,18 @@ def list_sales_orders(
     elif delivery_date_end:
         filters['delivery_date'] = ['<=', delivery_date_end]
 
-    # Amount filters
-    if min_amount and max_amount:
-        filters['grand_total'] = ['between', [min_amount, max_amount]]
-    elif min_amount:
-        filters['grand_total'] = ['>=', min_amount]
-    elif max_amount:
-        filters['grand_total'] = ['<=', max_amount]
+    # Amount filters - use explicit None checks and type conversion
+    if min_amount is not None and max_amount is not None:
+        min_val = float(min_amount)
+        max_val = float(max_amount)
+        if min_val == max_val:
+            filters['grand_total'] = min_val
+        else:
+            filters['grand_total'] = ['between', [min_val, max_val]]
+    elif min_amount is not None:
+        filters['grand_total'] = ['>=', float(min_amount)]
+    elif max_amount is not None:
+        filters['grand_total'] = ['<=', float(max_amount)]
 
     # Validate sort_by field
     valid_sort_fields = ['name', 'transaction_date', 'delivery_date', 'grand_total',

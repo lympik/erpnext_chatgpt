@@ -406,7 +406,10 @@ def handle_tool_calls(tool_calls: List[Any], conversation: List[Dict[str, Any]],
             tool_usage_entry['fetched_entities'] = extract_fetched_entities(function_name, response_data if isinstance(response_data, dict) else {})
 
         except Exception as e:
-            frappe.log_error(f"Error calling function {function_name} with args {json.dumps(function_args)}: {str(e)}", "OpenAI Tool Error")
+            # Keep title short (max 140 chars) to avoid secondary CharacterLengthExceededError
+            error_title = f"Tool Error: {function_name}"[:140]
+            error_message = f"Function: {function_name}\nArgs: {json.dumps(function_args)}\nError: {str(e)}"
+            frappe.log_error(message=error_message, title=error_title)
             tool_usage_entry['status'] = 'error'
             tool_usage_entry['error'] = str(e)
             raise
@@ -549,7 +552,7 @@ def ask_openai_question(conversation: List[Dict[str, Any]]) -> Dict[str, Any]:
             "error": "max_iterations_reached"
         }
     except Exception as e:
-        frappe.log_error(str(e), "OpenAI API Error")
+        frappe.log_error(message=str(e), title="OpenAI API Error")
         return {"error": str(e), "tool_usage": []}
 
 @frappe.whitelist()
