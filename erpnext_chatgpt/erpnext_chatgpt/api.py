@@ -450,6 +450,28 @@ def estimate_token_count(messages: List[Dict[str, Any]]) -> int:
     return sum(tokens_per_message + int(len(str(message.get("content", "")).split()) * tokens_per_word)
                for message in messages if message.get("content") is not None)
 
+def extract_messages_for_storage(conversation: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Extract only user messages and assistant final responses for storage.
+    Skips system messages, tool calls, and tool responses to save space.
+    """
+    messages_to_save = []
+    for m in conversation:
+        role = m.get("role")
+        if role == "user":
+            messages_to_save.append({"role": "user", "content": m.get("content", "")})
+        elif role == "assistant" and m.get("content") and not m.get("tool_calls"):
+            # Only save assistant messages that have content (final answers)
+            # Skip assistant messages that are just tool_calls
+            messages_to_save.append({
+                "role": "assistant",
+                "content": m.get("content", ""),
+                "content_display": m.get("content_display"),
+                "tool_usage": m.get("tool_usage")
+            })
+    return messages_to_save
+
+
 def trim_conversation_to_token_limit(conversation: List[Dict[str, Any]], token_limit: int = None) -> List[Dict[str, Any]]:
     """
     Trim the conversation so that its total token count does not exceed the specified limit.
@@ -585,8 +607,9 @@ def ask_openai_question(session_id: str, message: str) -> Dict[str, Any]:
 
                         # Save conversation to database if in session mode
                         if session_doc:
-                            # Remove system message before saving (it's added fresh each time)
-                            messages_to_save = [m for m in conversation if m.get("role") != "system"]
+                            # Only save user messages and assistant final responses
+                            # Skip system messages, tool calls, and tool responses to save space
+                            messages_to_save = extract_messages_for_storage(conversation)
                             session_doc.messages = json.dumps(messages_to_save)
                             session_doc.model_used = model
                             session_doc.save(ignore_permissions=False)
@@ -633,7 +656,7 @@ def ask_openai_question(session_id: str, message: str) -> Dict[str, Any]:
         })
 
         if session_doc:
-            messages_to_save = [m for m in conversation if m.get("role") != "system"]
+            messages_to_save = extract_messages_for_storage(conversation)
             session_doc.messages = json.dumps(messages_to_save)
             session_doc.model_used = model
             session_doc.save(ignore_permissions=False)
