@@ -8,6 +8,76 @@ from decimal import Decimal
 logger = frappe.logger("aiassistant", allow_site=True)
 logger.setLevel(logging.DEBUG)
 
+# Configuration for aggregate_data tool - defines allowed fields per doctype for security
+AGGREGATION_CONFIG = {
+    'Sales Invoice': {
+        'date_field': 'posting_date',
+        'group_fields': ['customer', 'customer_name', 'territory', 'customer_group',
+                         'sales_partner', 'currency', 'status', 'company'],
+        'agg_fields': ['grand_total', 'net_total', 'outstanding_amount', 'paid_amount',
+                       'total_qty', 'base_grand_total'],
+        'default_filters': {'docstatus': 1}
+    },
+    'Sales Order': {
+        'date_field': 'transaction_date',
+        'group_fields': ['customer', 'customer_name', 'territory', 'customer_group',
+                         'sales_partner', 'currency', 'status', 'company'],
+        'agg_fields': ['grand_total', 'net_total', 'total_qty', 'base_grand_total'],
+        'default_filters': {'docstatus': 1}
+    },
+    'Purchase Invoice': {
+        'date_field': 'posting_date',
+        'group_fields': ['supplier', 'supplier_name', 'supplier_group', 'currency',
+                         'status', 'company'],
+        'agg_fields': ['grand_total', 'net_total', 'outstanding_amount', 'total_qty'],
+        'default_filters': {'docstatus': 1}
+    },
+    'Purchase Order': {
+        'date_field': 'transaction_date',
+        'group_fields': ['supplier', 'supplier_name', 'supplier_group', 'currency',
+                         'status', 'company'],
+        'agg_fields': ['grand_total', 'net_total', 'total_qty'],
+        'default_filters': {'docstatus': 1}
+    },
+    'Delivery Note': {
+        'date_field': 'posting_date',
+        'group_fields': ['customer', 'customer_name', 'territory', 'status', 'company'],
+        'agg_fields': ['grand_total', 'net_total', 'total_qty'],
+        'default_filters': {'docstatus': 1}
+    },
+    'Quotation': {
+        'date_field': 'transaction_date',
+        'group_fields': ['party_name', 'territory', 'customer_group', 'status', 'company'],
+        'agg_fields': ['grand_total', 'net_total', 'total_qty'],
+        'default_filters': {}
+    },
+    'Payment Entry': {
+        'date_field': 'posting_date',
+        'group_fields': ['party_type', 'party', 'party_name', 'payment_type',
+                         'mode_of_payment', 'status', 'company'],
+        'agg_fields': ['paid_amount', 'received_amount', 'base_paid_amount'],
+        'default_filters': {'docstatus': 1}
+    },
+    'Journal Entry': {
+        'date_field': 'posting_date',
+        'group_fields': ['voucher_type', 'company'],
+        'agg_fields': ['total_debit', 'total_credit'],
+        'default_filters': {'docstatus': 1}
+    },
+    'Stock Entry': {
+        'date_field': 'posting_date',
+        'group_fields': ['stock_entry_type', 'from_warehouse', 'to_warehouse', 'company'],
+        'agg_fields': ['total_amount', 'total_incoming_value', 'total_outgoing_value'],
+        'default_filters': {'docstatus': 1}
+    },
+    'GL Entry': {
+        'date_field': 'posting_date',
+        'group_fields': ['account', 'party_type', 'party', 'cost_center', 'company'],
+        'agg_fields': ['debit', 'credit', 'debit_in_account_currency', 'credit_in_account_currency'],
+        'default_filters': {'is_cancelled': 0}
+    }
+}
+
 def json_serial(obj):
     """JSON serializer for objects not serializable by default json code"""
     if isinstance(obj, (datetime, date)):
@@ -806,7 +876,7 @@ def list_customers(
         filters=filters,
         fields=['name', 'customer_name', 'customer_group', 'territory',
                 'customer_type', 'disabled', 'creation', 'modified',
-                'credit_limit', 'customer_primary_contact', 'customer_primary_address'],
+                'customer_primary_contact', 'customer_primary_address'],
         order_by=order_by,
         limit_start=offset,
         limit_page_length=limit
@@ -2499,6 +2569,271 @@ get_service_protocol_tool = {
 }
 
 
+def get_top_customers_by_sales(limit=5, start_date=None, end_date=None):
+    """
+    Get top customers ranked by total sales amount.
+    Aggregates all submitted sales invoices by customer.
+    """
+    date_filter = ""
+    params = [limit]
+
+    if start_date and end_date:
+        date_filter = "AND posting_date BETWEEN %s AND %s"
+        params = [start_date, end_date, limit]
+    elif start_date:
+        date_filter = "AND posting_date >= %s"
+        params = [start_date, limit]
+    elif end_date:
+        date_filter = "AND posting_date <= %s"
+        params = [end_date, limit]
+
+    query = """
+        SELECT
+            customer,
+            customer_name,
+            COUNT(*) as invoice_count,
+            SUM(grand_total) as total_sales,
+            SUM(outstanding_amount) as total_outstanding
+        FROM `tabSales Invoice`
+        WHERE docstatus = 1 {date_filter}
+        GROUP BY customer, customer_name
+        ORDER BY total_sales DESC
+        LIMIT %s
+    """.format(date_filter=date_filter)
+
+    results = frappe.db.sql(query, params, as_dict=True)
+
+    return json.dumps({
+        'top_customers': results,
+        'limit': limit,
+        'start_date': start_date,
+        'end_date': end_date
+    }, default=json_serial)
+
+
+get_top_customers_by_sales_tool = {
+    "type": "function",
+    "function": {
+        "name": "get_top_customers_by_sales",
+        "description": "Get top customers ranked by total sales amount. Aggregates all submitted sales invoices and returns customers sorted by total revenue. Use this when asked about best customers, top customers, highest revenue customers, or customer rankings by sales.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Number of top customers to return (default: 5)"
+                },
+                "start_date": {
+                    "type": "string",
+                    "description": "Start date filter in YYYY-MM-DD format (optional)"
+                },
+                "end_date": {
+                    "type": "string",
+                    "description": "End date filter in YYYY-MM-DD format (optional)"
+                }
+            },
+            "required": []
+        }
+    }
+}
+
+
+def aggregate_data(
+    doctype,
+    group_by,
+    aggregate_field,
+    aggregate_function="SUM",
+    filters=None,
+    start_date=None,
+    end_date=None,
+    order="desc",
+    limit=10
+):
+    """
+    Generic aggregation tool for ERPNext data.
+    Performs GROUP BY queries with SUM, COUNT, AVG, MIN, MAX.
+    """
+    # Validate doctype
+    if doctype not in AGGREGATION_CONFIG:
+        return json.dumps({
+            'error': f"Doctype '{doctype}' not supported. Supported: {list(AGGREGATION_CONFIG.keys())}"
+        }, default=json_serial)
+
+    config = AGGREGATION_CONFIG[doctype]
+    date_field = config['date_field']
+
+    # Validate aggregate_function
+    valid_functions = ['SUM', 'COUNT', 'AVG', 'MIN', 'MAX']
+    aggregate_function = aggregate_function.upper()
+    if aggregate_function not in valid_functions:
+        return json.dumps({
+            'error': f"Invalid function '{aggregate_function}'. Use: {valid_functions}"
+        }, default=json_serial)
+
+    # Validate aggregate_field (security)
+    if aggregate_field not in config['agg_fields']:
+        return json.dumps({
+            'error': f"Field '{aggregate_field}' not allowed for {doctype}. Allowed: {config['agg_fields']}"
+        }, default=json_serial)
+
+    # Check if time-based grouping
+    time_groups = ['month', 'quarter', 'year']
+    is_time_group = group_by.lower() in time_groups
+
+    # Validate group_by field (security)
+    if not is_time_group and group_by not in config['group_fields']:
+        return json.dumps({
+            'error': f"Cannot group by '{group_by}' for {doctype}. Allowed: {config['group_fields'] + time_groups}"
+        }, default=json_serial)
+
+    # Build WHERE clause
+    where_clauses = []
+    params = []
+
+    # Add default filters (e.g., docstatus = 1)
+    for field, value in config.get('default_filters', {}).items():
+        where_clauses.append(f"`{field}` = %s")
+        params.append(value)
+
+    # Add date filters
+    if start_date and end_date:
+        where_clauses.append(f"`{date_field}` BETWEEN %s AND %s")
+        params.extend([start_date, end_date])
+    elif start_date:
+        where_clauses.append(f"`{date_field}` >= %s")
+        params.append(start_date)
+    elif end_date:
+        where_clauses.append(f"`{date_field}` <= %s")
+        params.append(end_date)
+
+    # Add custom filters
+    if filters:
+        for field, value in filters.items():
+            # Only allow filtering on group_fields for security
+            if field in config['group_fields']:
+                where_clauses.append(f"`{field}` = %s")
+                params.append(value)
+
+    where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+
+    # Build GROUP BY expression
+    if is_time_group:
+        group_type = group_by.lower()
+        if group_type == 'month':
+            group_expr = f"DATE_FORMAT(`{date_field}`, '%Y-%m')"
+        elif group_type == 'quarter':
+            group_expr = f"CONCAT(YEAR(`{date_field}`), '-Q', QUARTER(`{date_field}`))"
+        else:  # year
+            group_expr = f"YEAR(`{date_field}`)"
+        select_group = f"{group_expr} as `group`"
+        group_by_sql = group_expr
+    else:
+        select_group = f"`{group_by}` as `group`"
+        group_by_sql = f"`{group_by}`"
+
+    # Validate order
+    order = order.lower()
+    if order not in ['asc', 'desc']:
+        order = 'desc'
+
+    # Build and execute query
+    query = f"""
+        SELECT
+            {select_group},
+            {aggregate_function}(`{aggregate_field}`) as agg_value,
+            COUNT(*) as record_count
+        FROM `tab{doctype}`
+        {where_sql}
+        GROUP BY {group_by_sql}
+        ORDER BY agg_value {order}
+        LIMIT %s
+    """
+    params.append(limit)
+
+    try:
+        results = frappe.db.sql(query, params, as_dict=True)
+
+        # Calculate grand total
+        grand_total = sum(r.get('agg_value', 0) or 0 for r in results)
+
+        return json.dumps({
+            'doctype': doctype,
+            'group_by': group_by,
+            'aggregate_field': aggregate_field,
+            'aggregate_function': aggregate_function,
+            'results': results,
+            'total_groups': len(results),
+            'grand_total': grand_total,
+            'filters_applied': {
+                'start_date': start_date,
+                'end_date': end_date,
+                'custom': filters
+            }
+        }, default=json_serial)
+
+    except Exception as e:
+        frappe.log_error(f"Aggregation error: {str(e)}", "Aggregate Data Error")
+        return json.dumps({
+            'error': str(e)
+        }, default=json_serial)
+
+
+aggregate_data_tool = {
+    "type": "function",
+    "function": {
+        "name": "aggregate_data",
+        "description": "Aggregate ERPNext data with GROUP BY. Use for questions like 'top customers by sales', 'total revenue by territory', 'average order value by month', 'count of invoices per status'. Supports SUM, COUNT, AVG, MIN, MAX aggregations.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "doctype": {
+                    "type": "string",
+                    "enum": ["Sales Invoice", "Sales Order", "Purchase Invoice", "Purchase Order",
+                             "Delivery Note", "Quotation", "Payment Entry", "Journal Entry",
+                             "Stock Entry", "GL Entry"],
+                    "description": "The ERPNext document type to aggregate"
+                },
+                "group_by": {
+                    "type": "string",
+                    "description": "Field to group by (e.g., 'customer', 'territory', 'status') or time period ('month', 'quarter', 'year')"
+                },
+                "aggregate_field": {
+                    "type": "string",
+                    "description": "Numeric field to aggregate (e.g., 'grand_total', 'qty', 'outstanding_amount')"
+                },
+                "aggregate_function": {
+                    "type": "string",
+                    "enum": ["SUM", "COUNT", "AVG", "MIN", "MAX"],
+                    "description": "Aggregation function to apply (default: SUM)"
+                },
+                "start_date": {
+                    "type": "string",
+                    "description": "Filter start date (YYYY-MM-DD)"
+                },
+                "end_date": {
+                    "type": "string",
+                    "description": "Filter end date (YYYY-MM-DD)"
+                },
+                "filters": {
+                    "type": "object",
+                    "description": "Additional filters as key-value pairs (e.g., {\"status\": \"Paid\", \"territory\": \"Europe\"})"
+                },
+                "order": {
+                    "type": "string",
+                    "enum": ["desc", "asc"],
+                    "description": "Sort order for results (default: desc)"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of groups to return (default: 10)"
+                }
+            },
+            "required": ["doctype", "group_by", "aggregate_field"]
+        }
+    }
+}
+
+
 def get_tools():
     return [
         # Final answer tool - MUST be called to respond to user
@@ -2528,6 +2863,8 @@ def get_tools():
         list_service_protocols_tool,
         get_service_protocol_tool,
         create_lead_tool,
+        get_top_customers_by_sales_tool,
+        aggregate_data_tool,
     ]
 
 
@@ -2556,4 +2893,6 @@ available_functions = {
     "list_service_protocols": list_service_protocols,
     "get_service_protocol": get_service_protocol,
     "create_lead": create_lead,
+    "get_top_customers_by_sales": get_top_customers_by_sales,
+    "aggregate_data": aggregate_data,
 }
