@@ -2834,6 +2834,310 @@ aggregate_data_tool = {
 }
 
 
+def get_customer_summary(
+    customer,
+    include_orders=True,
+    include_invoices=True,
+    include_payments=True,
+    include_delivery_notes=True,
+    include_quotations=True,
+    date_range_months=12,
+    limit_per_type=5
+):
+    """
+    Get a 360-degree view of a customer including summary statistics and recent transactions.
+    Returns limited records per doctype - use specific list tools for full data.
+    """
+    # Calculate date range (approximate months using 30 days)
+    end_date = date.today()
+    start_date = end_date - timedelta(days=date_range_months * 30)
+
+    # Get customer basic info
+    customer_info = frappe.db.get_value(
+        'Customer',
+        customer,
+        ['name', 'customer_name', 'customer_group', 'territory', 'customer_type',
+         'default_currency', 'default_price_list', 'disabled'],
+        as_dict=True
+    )
+
+    if not customer_info:
+        return json.dumps({
+            'error': f"Customer '{customer}' not found"
+        }, default=json_serial)
+
+    result = {
+        'customer': customer_info,
+        'date_range': {
+            'start_date': str(start_date),
+            'end_date': str(end_date),
+            'months': date_range_months
+        },
+        'summary': {},
+        'recent_records': {},
+        'note': 'This is a summary view with limited records. Use specific list tools (list_invoices, list_sales_orders, etc.) for complete data.'
+    }
+
+    # Sales Invoices
+    if include_invoices:
+        # Get summary stats
+        invoice_stats = frappe.db.sql("""
+            SELECT
+                COUNT(*) as total_count,
+                SUM(grand_total) as total_amount,
+                SUM(outstanding_amount) as total_outstanding,
+                SUM(CASE WHEN docstatus = 1 THEN grand_total ELSE 0 END) as submitted_amount
+            FROM `tabSales Invoice`
+            WHERE customer = %s AND posting_date BETWEEN %s AND %s
+        """, (customer, start_date, end_date), as_dict=True)[0]
+
+        # Get recent invoices (limited)
+        recent_invoices = frappe.db.sql("""
+            SELECT name, posting_date, grand_total, outstanding_amount, status
+            FROM `tabSales Invoice`
+            WHERE customer = %s AND posting_date BETWEEN %s AND %s AND docstatus = 1
+            ORDER BY posting_date DESC
+            LIMIT %s
+        """, (customer, start_date, end_date, limit_per_type), as_dict=True)
+
+        # Get total count for "has_more" indicator
+        total_invoice_count = frappe.db.count('Sales Invoice', {
+            'customer': customer,
+            'posting_date': ['between', [start_date, end_date]],
+            'docstatus': 1
+        })
+
+        result['summary']['invoices'] = {
+            'total_count': invoice_stats.get('total_count') or 0,
+            'total_amount': invoice_stats.get('total_amount') or 0,
+            'total_outstanding': invoice_stats.get('total_outstanding') or 0
+        }
+        result['recent_records']['invoices'] = {
+            'records': recent_invoices,
+            'showing': len(recent_invoices),
+            'total_available': total_invoice_count,
+            'has_more': total_invoice_count > limit_per_type
+        }
+
+    # Sales Orders
+    if include_orders:
+        order_stats = frappe.db.sql("""
+            SELECT
+                COUNT(*) as total_count,
+                SUM(grand_total) as total_amount,
+                SUM(CASE WHEN status IN ('To Deliver and Bill', 'To Bill', 'To Deliver') THEN grand_total ELSE 0 END) as pending_amount
+            FROM `tabSales Order`
+            WHERE customer = %s AND transaction_date BETWEEN %s AND %s AND docstatus = 1
+        """, (customer, start_date, end_date), as_dict=True)[0]
+
+        recent_orders = frappe.db.sql("""
+            SELECT name, transaction_date, grand_total, status, delivery_status, billing_status
+            FROM `tabSales Order`
+            WHERE customer = %s AND transaction_date BETWEEN %s AND %s AND docstatus = 1
+            ORDER BY transaction_date DESC
+            LIMIT %s
+        """, (customer, start_date, end_date, limit_per_type), as_dict=True)
+
+        total_order_count = frappe.db.count('Sales Order', {
+            'customer': customer,
+            'transaction_date': ['between', [start_date, end_date]],
+            'docstatus': 1
+        })
+
+        result['summary']['orders'] = {
+            'total_count': order_stats.get('total_count') or 0,
+            'total_amount': order_stats.get('total_amount') or 0,
+            'pending_amount': order_stats.get('pending_amount') or 0
+        }
+        result['recent_records']['orders'] = {
+            'records': recent_orders,
+            'showing': len(recent_orders),
+            'total_available': total_order_count,
+            'has_more': total_order_count > limit_per_type
+        }
+
+    # Delivery Notes
+    if include_delivery_notes:
+        dn_stats = frappe.db.sql("""
+            SELECT
+                COUNT(*) as total_count,
+                SUM(grand_total) as total_amount
+            FROM `tabDelivery Note`
+            WHERE customer = %s AND posting_date BETWEEN %s AND %s AND docstatus = 1
+        """, (customer, start_date, end_date), as_dict=True)[0]
+
+        recent_dns = frappe.db.sql("""
+            SELECT name, posting_date, grand_total, status
+            FROM `tabDelivery Note`
+            WHERE customer = %s AND posting_date BETWEEN %s AND %s AND docstatus = 1
+            ORDER BY posting_date DESC
+            LIMIT %s
+        """, (customer, start_date, end_date, limit_per_type), as_dict=True)
+
+        total_dn_count = frappe.db.count('Delivery Note', {
+            'customer': customer,
+            'posting_date': ['between', [start_date, end_date]],
+            'docstatus': 1
+        })
+
+        result['summary']['delivery_notes'] = {
+            'total_count': dn_stats.get('total_count') or 0,
+            'total_amount': dn_stats.get('total_amount') or 0
+        }
+        result['recent_records']['delivery_notes'] = {
+            'records': recent_dns,
+            'showing': len(recent_dns),
+            'total_available': total_dn_count,
+            'has_more': total_dn_count > limit_per_type
+        }
+
+    # Payment Entries
+    if include_payments:
+        payment_stats = frappe.db.sql("""
+            SELECT
+                COUNT(*) as total_count,
+                SUM(paid_amount) as total_paid
+            FROM `tabPayment Entry`
+            WHERE party_type = 'Customer' AND party = %s
+                AND posting_date BETWEEN %s AND %s AND docstatus = 1
+        """, (customer, start_date, end_date), as_dict=True)[0]
+
+        recent_payments = frappe.db.sql("""
+            SELECT name, posting_date, paid_amount, mode_of_payment, reference_no
+            FROM `tabPayment Entry`
+            WHERE party_type = 'Customer' AND party = %s
+                AND posting_date BETWEEN %s AND %s AND docstatus = 1
+            ORDER BY posting_date DESC
+            LIMIT %s
+        """, (customer, start_date, end_date, limit_per_type), as_dict=True)
+
+        total_payment_count = frappe.db.sql("""
+            SELECT COUNT(*) FROM `tabPayment Entry`
+            WHERE party_type = 'Customer' AND party = %s
+                AND posting_date BETWEEN %s AND %s AND docstatus = 1
+        """, (customer, start_date, end_date))[0][0]
+
+        result['summary']['payments'] = {
+            'total_count': payment_stats.get('total_count') or 0,
+            'total_paid': payment_stats.get('total_paid') or 0
+        }
+        result['recent_records']['payments'] = {
+            'records': recent_payments,
+            'showing': len(recent_payments),
+            'total_available': total_payment_count,
+            'has_more': total_payment_count > limit_per_type
+        }
+
+    # Quotations
+    if include_quotations:
+        quote_stats = frappe.db.sql("""
+            SELECT
+                COUNT(*) as total_count,
+                SUM(grand_total) as total_amount,
+                SUM(CASE WHEN status = 'Open' THEN grand_total ELSE 0 END) as open_amount
+            FROM `tabQuotation`
+            WHERE party_name = %s AND transaction_date BETWEEN %s AND %s AND docstatus = 1
+        """, (customer, start_date, end_date), as_dict=True)[0]
+
+        recent_quotes = frappe.db.sql("""
+            SELECT name, transaction_date, grand_total, status
+            FROM `tabQuotation`
+            WHERE party_name = %s AND transaction_date BETWEEN %s AND %s AND docstatus = 1
+            ORDER BY transaction_date DESC
+            LIMIT %s
+        """, (customer, start_date, end_date, limit_per_type), as_dict=True)
+
+        total_quote_count = frappe.db.count('Quotation', {
+            'party_name': customer,
+            'transaction_date': ['between', [start_date, end_date]],
+            'docstatus': 1
+        })
+
+        result['summary']['quotations'] = {
+            'total_count': quote_stats.get('total_count') or 0,
+            'total_amount': quote_stats.get('total_amount') or 0,
+            'open_amount': quote_stats.get('open_amount') or 0
+        }
+        result['recent_records']['quotations'] = {
+            'records': recent_quotes,
+            'showing': len(recent_quotes),
+            'total_available': total_quote_count,
+            'has_more': total_quote_count > limit_per_type
+        }
+
+    # Calculate overall customer health metrics
+    total_revenue = result['summary'].get('invoices', {}).get('total_amount', 0) or 0
+    total_outstanding = result['summary'].get('invoices', {}).get('total_outstanding', 0) or 0
+    total_paid = result['summary'].get('payments', {}).get('total_paid', 0) or 0
+
+    result['health_metrics'] = {
+        'total_revenue': total_revenue,
+        'total_outstanding': total_outstanding,
+        'collection_rate': round((total_paid / total_revenue * 100), 2) if total_revenue > 0 else 0,
+        'outstanding_ratio': round((total_outstanding / total_revenue * 100), 2) if total_revenue > 0 else 0
+    }
+
+    return json.dumps(result, default=json_serial)
+
+
+get_customer_summary_tool = {
+    "type": "function",
+    "function": {
+        "name": "get_customer_summary",
+        "description": """Get a 360-degree summary view of a customer including basic info, transaction statistics, and recent records.
+
+Returns:
+- Summary statistics: ACCURATE totals aggregated from ALL records (total revenue, total outstanding, counts, etc.)
+- Recent records: LIMITED sample (default 5 per type) - shows 'has_more' flag if more exist
+- Health metrics: Collection rate, outstanding ratio
+
+Use this for quick customer overview. For FULL record lists, use specific tools:
+- list_invoices(customer=...) for all invoices
+- list_sales_orders(customer=...) for all orders
+- list_delivery_notes(customer=...) for all delivery notes
+- get_payments(party=...) for all payments""",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "customer": {
+                    "type": "string",
+                    "description": "Customer name or ID (use lookup_entity first if needed)"
+                },
+                "include_orders": {
+                    "type": "boolean",
+                    "description": "Include sales orders summary and recent records (default: true)"
+                },
+                "include_invoices": {
+                    "type": "boolean",
+                    "description": "Include sales invoices summary and recent records (default: true)"
+                },
+                "include_payments": {
+                    "type": "boolean",
+                    "description": "Include payment entries summary and recent records (default: true)"
+                },
+                "include_delivery_notes": {
+                    "type": "boolean",
+                    "description": "Include delivery notes summary and recent records (default: true)"
+                },
+                "include_quotations": {
+                    "type": "boolean",
+                    "description": "Include quotations summary and recent records (default: true)"
+                },
+                "date_range_months": {
+                    "type": "integer",
+                    "description": "Number of months to look back (default: 12)"
+                },
+                "limit_per_type": {
+                    "type": "integer",
+                    "description": "Maximum recent records to return per document type (default: 5, max: 10)"
+                }
+            },
+            "required": ["customer"]
+        }
+    }
+}
+
+
 def get_tools():
     return [
         # Final answer tool - MUST be called to respond to user
@@ -2865,6 +3169,7 @@ def get_tools():
         create_lead_tool,
         get_top_customers_by_sales_tool,
         aggregate_data_tool,
+        get_customer_summary_tool,
     ]
 
 
@@ -2895,4 +3200,5 @@ available_functions = {
     "create_lead": create_lead,
     "get_top_customers_by_sales": get_top_customers_by_sales,
     "aggregate_data": aggregate_data,
+    "get_customer_summary": get_customer_summary,
 }
