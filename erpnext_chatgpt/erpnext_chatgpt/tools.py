@@ -431,11 +431,15 @@ CRITICAL: After calling lookup_entity, you MUST call the appropriate query tool 
 }
 
 
-def get_sales_invoices(start_date=None, end_date=None):
+def get_sales_invoices(start_date=None, end_date=None, customer=None, status=None):
     try:
         filters = {}
         if start_date and end_date:
             filters['posting_date'] = ['between', [start_date, end_date]]
+        if customer:
+            filters['customer'] = customer
+        if status:
+            filters['status'] = status
 
         # Instead of fetching all fields, only get essential ones for summary
         # This prevents memory issues with large datasets
@@ -478,7 +482,7 @@ get_sales_invoices_tool = {
     "type": "function",
     "function": {
         "name": "get_sales_invoices",
-        "description": "Retrieve sales invoices within a date range. Returns invoice details including customer, amounts, payment status, and items. Use when asked about sales, revenue, or customer invoices.",
+        "description": "Retrieve sales invoices with optional date range and customer filtering. Returns invoice details including customer, amounts, payment status, and items. Use when asked about sales, revenue, or customer invoices.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -490,8 +494,17 @@ get_sales_invoices_tool = {
                     "type": "string",
                     "description": "End date in YYYY-MM-DD format",
                 },
+                "customer": {
+                    "type": "string",
+                    "description": "Exact customer name to filter invoices by (use lookup_entity first to resolve informal names)",
+                },
+                "status": {
+                    "type": "string",
+                    "enum": ["Draft", "Return", "Credit Note Issued", "Submitted", "Paid", "Partly Paid", "Unpaid", "Overdue", "Cancelled"],
+                    "description": "Invoice status filter",
+                },
             },
-            "required": ["start_date", "end_date"],
+            "required": [],
         },
     },
 }
