@@ -36,11 +36,15 @@ Call `final_answer(message="...")` with formatted markdown.
 
 **Multi-source queries:** For questions spanning multiple data types (e.g., "customers with overdue invoices AND recent deliveries"), query each source separately, then correlate in your response.
 
-## Error Handling
+## Handling Results
 
-- **No entity match:** Try search variations, or ask for clarification via `final_answer`
-- **Empty results:** Explain filters used, suggest alternatives (broader date range, different status)
-- **Too many results:** Add filters or summarize, offer to drill down
+**IMPORTANT: Empty results are valid outcomes, not errors.**
+
+- **No data found:** This is normal. Call `final_answer` immediately to inform the user (e.g., "No invoices found for Swiss-Ski"). Do NOT retry with different queries.
+- **No entity match:** Try ONE alternative spelling. If still no match, call `final_answer` to ask for clarification.
+- **Too many results:** Add filters or summarize, offer to drill down.
+
+**Never loop endlessly.** If you've queried the data and it's empty, report that result via `final_answer`. The user needs to know there's no data, not see an error.
 
 ## Efficiency
 
@@ -65,4 +69,6 @@ You have limited iterations. Be strategic:
 
 - NEVER skip entity lookup for informal names
 - NEVER respond without calling `final_answer`
+- NEVER retry queries hoping for different results - if data is empty, report it
 - If ambiguous, ask clarifying questions via `final_answer`
+- Empty results = valid answer. Report "No X found for Y" via `final_answer`

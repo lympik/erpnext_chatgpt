@@ -1,6 +1,9 @@
 // Wait for the DOM to be fully loaded before initializing
 document.addEventListener("DOMContentLoaded", initializeChat);
 
+// Version marker for debugging - remove after testing
+console.log("ERPNext ChatGPT Frontend loaded - v2.0 with write confirmation support");
+
 // Session-based conversation state
 let currentSessionId = null;
 let conversation = []; // Local display cache
@@ -481,6 +484,9 @@ async function askQuestion(question) {
 
     const data = await response.json();
     console.log("API response:", data);
+    console.log("data.message:", data.message);
+    console.log("data.message?.status:", data.message?.status);
+    console.log("Status equals pending_confirmation:", data.message?.status === "pending_confirmation");
 
     // Check if this is a pending confirmation response
     if (data.message?.status === "pending_confirmation") {
@@ -494,7 +500,16 @@ async function askQuestion(question) {
       }
 
       // Display the confirmation UI
-      renderWriteConfirmation(pendingConfirmation);
+      try {
+        renderWriteConfirmation(pendingConfirmation);
+      } catch (err) {
+        console.error("Error rendering confirmation UI:", err);
+        // Fall back to displaying a simple message
+        const answerDiv = document.getElementById("answer");
+        if (answerDiv) {
+          answerDiv.innerHTML += `<div class="alert alert-danger">Error displaying confirmation: ${err.message}</div>`;
+        }
+      }
       return; // Don't process as a normal response
     }
 
@@ -1207,83 +1222,92 @@ async function loadDompurify() {
 // =============================================================================
 
 function renderWriteConfirmation(confirmationData) {
+  console.log("renderWriteConfirmation called with:", confirmationData);
+
   const answerDiv = document.getElementById("answer");
-  if (!answerDiv) return;
+  if (!answerDiv) {
+    console.error("answer div not found");
+    return;
+  }
 
   // Format the tool name for display
-  const toolDisplayName = formatToolName(confirmationData.tool_name);
+  const toolDisplayName = formatToolName(confirmationData.tool_name || 'unknown');
   const confirmationMessage = confirmationData.confirmation_message || `Execute ${toolDisplayName}`;
+  const params = confirmationData.parameters || {};
+
+  // Build parameter preview
+  let paramPreview = '';
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== null && value !== undefined && value !== '') {
+      const label = key.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+      paramPreview += `<div style="margin-bottom: 6px;"><strong>${escapeHTML(label)}:</strong> ${escapeHTML(String(value))}</div>`;
+    }
+  }
+  if (!paramPreview) {
+    paramPreview = '<em>No parameters specified</em>';
+  }
 
   // Create the confirmation panel HTML
   const confirmationPanel = document.createElement('div');
   confirmationPanel.id = 'write-confirmation-panel';
-  confirmationPanel.className = 'write-confirmation-panel';
+  confirmationPanel.className = 'alert alert-warning';
+  confirmationPanel.style.cssText = 'border-left: 4px solid #f0ad4e;';
   confirmationPanel.innerHTML = `
-    <div class="alert alert-warning" style="border-left: 4px solid #f0ad4e; margin: 0;">
-      <div style="display: flex; align-items: center; margin-bottom: 12px;">
-        <span style="font-size: 24px; margin-right: 10px;">⚠️</span>
-        <h5 style="margin: 0; font-weight: 600;">Confirm: ${escapeHTML(confirmationMessage)}</h5>
-      </div>
-      <p style="color: #666; margin-bottom: 15px; font-size: 13px;">
-        Please review the data below before proceeding with this operation.
-      </p>
-      <div class="confirmation-preview" style="background: #f8f9fa; border: 1px solid #e9ecef; border-radius: 6px; padding: 12px; margin-bottom: 15px;">
-        ${renderReadOnlyPreview(confirmationData.parameters)}
-      </div>
-      <div class="confirmation-actions" style="display: flex; gap: 10px; flex-wrap: wrap;">
-        <button id="confirmAcceptBtn" class="btn btn-success" style="display: flex; align-items: center; gap: 5px;">
-          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
-          Accept
-        </button>
-        <button id="confirmChangeBtn" class="btn btn-secondary" style="display: flex; align-items: center; gap: 5px;">
-          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>
-          Request Changes
-        </button>
-        <button id="confirmDenyBtn" class="btn btn-danger" style="display: flex; align-items: center; gap: 5px;">
-          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
-          Deny
-        </button>
-      </div>
-      <div id="changeInputArea" style="display: none; margin-top: 15px;">
-        <textarea
-          id="changeInputText"
-          class="form-control"
-          rows="3"
-          placeholder="What would you like to change? (e.g., 'Change the email to john@example.com')"
-          style="resize: vertical; margin-bottom: 10px;"
-        ></textarea>
-        <div style="display: flex; gap: 10px;">
-          <button id="submitChangeBtn" class="btn btn-primary">
-            Send Changes
-          </button>
-          <button id="cancelChangeBtn" class="btn btn-link">
-            Cancel
-          </button>
-        </div>
+    <div style="display: flex; align-items: center; margin-bottom: 12px;">
+      <span style="font-size: 24px; margin-right: 10px;">⚠️</span>
+      <h5 style="margin: 0; font-weight: 600;">Confirm: ${escapeHTML(confirmationMessage)}</h5>
+    </div>
+    <p style="color: #666; margin-bottom: 15px; font-size: 13px;">
+      Please review the data below before proceeding with this operation.
+    </p>
+    <div style="background: #f8f9fa; border: 1px solid #e9ecef; border-radius: 6px; padding: 12px; margin-bottom: 15px;">
+      ${paramPreview}
+    </div>
+    <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+      <button id="confirmAcceptBtn" class="btn btn-success">✓ Accept</button>
+      <button id="confirmChangeBtn" class="btn btn-secondary">✎ Request Changes</button>
+      <button id="confirmDenyBtn" class="btn btn-danger">✕ Deny</button>
+    </div>
+    <div id="changeInputArea" style="display: none; margin-top: 15px;">
+      <textarea id="changeInputText" class="form-control" rows="3" placeholder="What would you like to change?" style="margin-bottom: 10px;"></textarea>
+      <div style="display: flex; gap: 10px;">
+        <button id="submitChangeBtn" class="btn btn-primary">Send Changes</button>
+        <button id="cancelChangeBtn" class="btn btn-link">Cancel</button>
       </div>
     </div>
   `;
 
   // Append the confirmation panel to the answer div
   answerDiv.appendChild(confirmationPanel);
+  console.log("Confirmation panel appended");
 
   // Scroll to the confirmation panel
   scrollToBottom();
 
-  // Attach event handlers
-  document.getElementById('confirmAcceptBtn').addEventListener('click', () => handleConfirmAction('accept'));
-  document.getElementById('confirmDenyBtn').addEventListener('click', () => handleConfirmAction('deny'));
-  document.getElementById('confirmChangeBtn').addEventListener('click', showChangeInput);
-  document.getElementById('cancelChangeBtn').addEventListener('click', hideChangeInput);
-  document.getElementById('submitChangeBtn').addEventListener('click', submitChangeRequest);
+  // Attach event handlers using setTimeout to ensure DOM is ready
+  setTimeout(() => {
+    const acceptBtn = document.getElementById('confirmAcceptBtn');
+    const denyBtn = document.getElementById('confirmDenyBtn');
+    const changeBtn = document.getElementById('confirmChangeBtn');
+    const cancelBtn = document.getElementById('cancelChangeBtn');
+    const submitBtn = document.getElementById('submitChangeBtn');
+    const changeInput = document.getElementById('changeInputText');
 
-  // Handle Enter key in the change input
-  document.getElementById('changeInputText').addEventListener('keypress', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      submitChangeRequest();
+    if (acceptBtn) acceptBtn.addEventListener('click', () => handleConfirmAction('accept'));
+    if (denyBtn) denyBtn.addEventListener('click', () => handleConfirmAction('deny'));
+    if (changeBtn) changeBtn.addEventListener('click', showChangeInput);
+    if (cancelBtn) cancelBtn.addEventListener('click', hideChangeInput);
+    if (submitBtn) submitBtn.addEventListener('click', submitChangeRequest);
+    if (changeInput) {
+      changeInput.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
+          submitChangeRequest();
+        }
+      });
     }
-  });
+    console.log("Event handlers attached");
+  }, 0);
 }
 
 function renderReadOnlyPreview(parameters) {
