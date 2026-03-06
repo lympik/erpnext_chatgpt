@@ -54,6 +54,13 @@
       "fieldtype": "JSON",
       "label": "Messages",
       "description": "Full OpenAI conversation array stored as JSON"
+    },
+    {
+      "fieldname": "pending_confirmation",
+      "fieldtype": "JSON",
+      "label": "Pending Confirmation",
+      "hidden": 1,
+      "description": "Stores pending write operation awaiting user confirmation"
     }
   ],
   "permissions": [

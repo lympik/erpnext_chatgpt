@@ -4,6 +4,7 @@ document.addEventListener("DOMContentLoaded", initializeChat);
 // Session-based conversation state
 let currentSessionId = null;
 let conversation = []; // Local display cache
+let pendingConfirmation = null; // Stores pending write operation confirmation
 
 async function initializeChat() {
   await loadMarkedJs();
@@ -102,6 +103,9 @@ async function loadSession(sessionId) {
       } else {
         displayConversation(conversation);
       }
+
+      // Check for pending confirmation
+      await checkPendingConfirmation(sessionId);
     } else {
       console.error("Failed to load session:", response?.message?.error);
       // Session not found, create new one
@@ -114,8 +118,28 @@ async function loadSession(sessionId) {
   }
 }
 
+async function checkPendingConfirmation(sessionId) {
+  try {
+    const response = await frappe.call({
+      method: "erpnext_chatgpt.erpnext_chatgpt.api.get_pending_confirmation",
+      args: { session_id: sessionId }
+    });
+
+    if (response?.message?.pending_confirmation) {
+      pendingConfirmation = response.message.pending_confirmation;
+      renderWriteConfirmation(pendingConfirmation);
+    }
+  } catch (error) {
+    console.error("Error checking pending confirmation:", error);
+  }
+}
+
 async function createNewConversation() {
   try {
+    // Clear any pending confirmation from previous conversation
+    pendingConfirmation = null;
+    removeConfirmationPanel();
+
     const response = await frappe.call({
       method: "erpnext_chatgpt.erpnext_chatgpt.api.create_conversation",
     });
@@ -316,6 +340,10 @@ function formatRelativeTime(dateStr) {
 
 // Make switchConversation globally available
 window.switchConversation = async function(sessionId) {
+  // Clear any pending confirmation from current conversation
+  pendingConfirmation = null;
+  removeConfirmationPanel();
+
   window.hideConversationList();
   await loadSession(sessionId);
   localStorage.setItem("lastAISessionId", sessionId);
@@ -454,6 +482,22 @@ async function askQuestion(question) {
     const data = await response.json();
     console.log("API response:", data);
 
+    // Check if this is a pending confirmation response
+    if (data.message?.status === "pending_confirmation") {
+      console.log("Pending confirmation received:", data.message.pending_confirmation);
+      pendingConfirmation = data.message.pending_confirmation;
+
+      // Update session ID if returned
+      if (data.message?.session_id) {
+        currentSessionId = data.message.session_id;
+        localStorage.setItem("lastAISessionId", currentSessionId);
+      }
+
+      // Display the confirmation UI
+      renderWriteConfirmation(pendingConfirmation);
+      return; // Don't process as a normal response
+    }
+
     const parsedMessage = parseResponseMessage(data);
     console.log("Parsed message with tool usage:", parsedMessage.tool_usage);
 
@@ -569,6 +613,11 @@ function displayConversation(conversation) {
       role === "user" ? "alert alert-primary" : "alert alert-light";
 
     let content = renderMessageContent(displayContent);
+
+    // If this is an assistant message with a created entity, show a quick link
+    if (role === "assistant" && message.created_entity) {
+      content += renderCreatedEntityLink(message.created_entity);
+    }
 
     // If this is an assistant message with tool usage, add a toggle button and hidden details
     if (role === "assistant" && message.tool_usage && message.tool_usage.length > 0) {
@@ -1151,3 +1200,324 @@ async function loadDompurify() {
     document.head.appendChild(script);
   });
 }
+
+
+// =============================================================================
+// Write Operation Confirmation UI
+// =============================================================================
+
+function renderWriteConfirmation(confirmationData) {
+  const answerDiv = document.getElementById("answer");
+  if (!answerDiv) return;
+
+  // Format the tool name for display
+  const toolDisplayName = formatToolName(confirmationData.tool_name);
+  const confirmationMessage = confirmationData.confirmation_message || `Execute ${toolDisplayName}`;
+
+  // Create the confirmation panel HTML
+  const confirmationPanel = document.createElement('div');
+  confirmationPanel.id = 'write-confirmation-panel';
+  confirmationPanel.className = 'write-confirmation-panel';
+  confirmationPanel.innerHTML = `
+    <div class="alert alert-warning" style="border-left: 4px solid #f0ad4e; margin: 0;">
+      <div style="display: flex; align-items: center; margin-bottom: 12px;">
+        <span style="font-size: 24px; margin-right: 10px;">⚠️</span>
+        <h5 style="margin: 0; font-weight: 600;">Confirm: ${escapeHTML(confirmationMessage)}</h5>
+      </div>
+      <p style="color: #666; margin-bottom: 15px; font-size: 13px;">
+        Please review the data below before proceeding with this operation.
+      </p>
+      <div class="confirmation-preview" style="background: #f8f9fa; border: 1px solid #e9ecef; border-radius: 6px; padding: 12px; margin-bottom: 15px;">
+        ${renderReadOnlyPreview(confirmationData.parameters)}
+      </div>
+      <div class="confirmation-actions" style="display: flex; gap: 10px; flex-wrap: wrap;">
+        <button id="confirmAcceptBtn" class="btn btn-success" style="display: flex; align-items: center; gap: 5px;">
+          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
+          Accept
+        </button>
+        <button id="confirmChangeBtn" class="btn btn-secondary" style="display: flex; align-items: center; gap: 5px;">
+          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>
+          Request Changes
+        </button>
+        <button id="confirmDenyBtn" class="btn btn-danger" style="display: flex; align-items: center; gap: 5px;">
+          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+          Deny
+        </button>
+      </div>
+      <div id="changeInputArea" style="display: none; margin-top: 15px;">
+        <textarea
+          id="changeInputText"
+          class="form-control"
+          rows="3"
+          placeholder="What would you like to change? (e.g., 'Change the email to john@example.com')"
+          style="resize: vertical; margin-bottom: 10px;"
+        ></textarea>
+        <div style="display: flex; gap: 10px;">
+          <button id="submitChangeBtn" class="btn btn-primary">
+            Send Changes
+          </button>
+          <button id="cancelChangeBtn" class="btn btn-link">
+            Cancel
+          </button>
+        </div>
+      </div>
+    </div>
+  `;
+
+  // Append the confirmation panel to the answer div
+  answerDiv.appendChild(confirmationPanel);
+
+  // Scroll to the confirmation panel
+  scrollToBottom();
+
+  // Attach event handlers
+  document.getElementById('confirmAcceptBtn').addEventListener('click', () => handleConfirmAction('accept'));
+  document.getElementById('confirmDenyBtn').addEventListener('click', () => handleConfirmAction('deny'));
+  document.getElementById('confirmChangeBtn').addEventListener('click', showChangeInput);
+  document.getElementById('cancelChangeBtn').addEventListener('click', hideChangeInput);
+  document.getElementById('submitChangeBtn').addEventListener('click', submitChangeRequest);
+
+  // Handle Enter key in the change input
+  document.getElementById('changeInputText').addEventListener('keypress', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      submitChangeRequest();
+    }
+  });
+}
+
+function renderReadOnlyPreview(parameters) {
+  if (!parameters || Object.keys(parameters).length === 0) {
+    return '<p style="color: #666; font-style: italic; margin: 0;">No parameters specified</p>';
+  }
+
+  return Object.entries(parameters)
+    .filter(([key, value]) => value !== null && value !== undefined && value !== '')
+    .map(([key, value]) => {
+      const label = formatLabel(key);
+      const displayValue = typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value);
+      return `
+        <div style="display: flex; margin-bottom: 8px; font-size: 14px;">
+          <span style="color: #495057; font-weight: 500; min-width: 120px;">${escapeHTML(label)}:</span>
+          <span style="color: #212529;">${escapeHTML(displayValue)}</span>
+        </div>
+      `;
+    }).join('');
+}
+
+function formatLabel(key) {
+  // Convert snake_case or camelCase to Title Case
+  return key
+    .replace(/_/g, ' ')
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .replace(/\b\w/g, l => l.toUpperCase());
+}
+
+function showChangeInput() {
+  document.getElementById('changeInputArea').style.display = 'block';
+  document.getElementById('changeInputText').focus();
+}
+
+function hideChangeInput() {
+  document.getElementById('changeInputArea').style.display = 'none';
+  document.getElementById('changeInputText').value = '';
+}
+
+async function handleConfirmAction(action) {
+  const acceptBtn = document.getElementById('confirmAcceptBtn');
+  const denyBtn = document.getElementById('confirmDenyBtn');
+  const changeBtn = document.getElementById('confirmChangeBtn');
+
+  // Disable all buttons
+  acceptBtn.disabled = true;
+  denyBtn.disabled = true;
+  changeBtn.disabled = true;
+
+  // Show loading state on the clicked button
+  const activeBtn = action === 'accept' ? acceptBtn : denyBtn;
+  const originalText = activeBtn.innerHTML;
+  activeBtn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status"></span> Processing...';
+
+  try {
+    await sendWriteConfirmation(action);
+  } catch (error) {
+    console.error('Error handling confirmation:', error);
+    frappe.msgprint({
+      title: 'Error',
+      indicator: 'red',
+      message: `Failed to process confirmation: ${error.message}`
+    });
+
+    // Re-enable buttons on error
+    acceptBtn.disabled = false;
+    denyBtn.disabled = false;
+    changeBtn.disabled = false;
+    activeBtn.innerHTML = originalText;
+  }
+}
+
+async function submitChangeRequest() {
+  const changeText = document.getElementById('changeInputText').value.trim();
+  if (!changeText) {
+    frappe.msgprint({
+      title: 'Input Required',
+      indicator: 'yellow',
+      message: 'Please describe what you would like to change.'
+    });
+    return;
+  }
+
+  const submitBtn = document.getElementById('submitChangeBtn');
+  submitBtn.disabled = true;
+  submitBtn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status"></span> Sending...';
+
+  try {
+    await sendWriteConfirmation('change', changeText);
+  } catch (error) {
+    console.error('Error submitting change request:', error);
+    frappe.msgprint({
+      title: 'Error',
+      indicator: 'red',
+      message: `Failed to submit changes: ${error.message}`
+    });
+
+    submitBtn.disabled = false;
+    submitBtn.innerHTML = 'Send Changes';
+  }
+}
+
+async function sendWriteConfirmation(action, userMessage = null) {
+  if (!currentSessionId) {
+    throw new Error('No active session');
+  }
+
+  // Remove the confirmation panel
+  removeConfirmationPanel();
+
+  // Clear the pending confirmation
+  pendingConfirmation = null;
+
+  // Show a processing message in the conversation
+  const processingMessage = document.createElement('div');
+  processingMessage.id = 'confirmation-processing';
+  processingMessage.className = 'alert alert-light';
+  processingMessage.innerHTML = `
+    <div style="display: flex; align-items: center; gap: 10px;">
+      <span class="spinner-border spinner-border-sm" role="status"></span>
+      <span>${action === 'accept' ? 'Executing operation...' : action === 'change' ? 'Processing your changes...' : 'Processing denial...'}</span>
+    </div>
+  `;
+  document.getElementById('answer').appendChild(processingMessage);
+  scrollToBottom();
+
+  try {
+    const response = await fetch(
+      "/api/method/erpnext_chatgpt.erpnext_chatgpt.api.confirm_write_operation",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Frappe-CSRF-Token": frappe.csrf_token,
+        },
+        body: JSON.stringify({
+          session_id: currentSessionId,
+          action: action,
+          user_message: userMessage
+        }),
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    const data = await response.json();
+    console.log("Confirmation response:", data);
+
+    // Remove the processing message
+    const processingEl = document.getElementById('confirmation-processing');
+    if (processingEl) {
+      processingEl.remove();
+    }
+
+    // Check if this is another pending confirmation (e.g., after 'change')
+    if (data.message?.status === "pending_confirmation") {
+      console.log("Another pending confirmation received:", data.message.pending_confirmation);
+      pendingConfirmation = data.message.pending_confirmation;
+      renderWriteConfirmation(pendingConfirmation);
+      return;
+    }
+
+    // Parse the response as a normal message
+    const parsedMessage = parseResponseMessage(data);
+
+    // Add to conversation, including created entity info if present
+    conversation.push({
+      role: "assistant",
+      content: parsedMessage.content,
+      content_display: parsedMessage.content_display,
+      tool_usage: parsedMessage.tool_usage,
+      created_entity: data.message?.created_entity || null
+    });
+
+    // Update session ID if returned
+    if (data.message?.session_id) {
+      currentSessionId = data.message.session_id;
+      localStorage.setItem("lastAISessionId", currentSessionId);
+    }
+
+    // Display the updated conversation
+    displayConversation(conversation);
+
+  } catch (error) {
+    // Remove the processing message on error
+    const processingEl = document.getElementById('confirmation-processing');
+    if (processingEl) {
+      processingEl.remove();
+    }
+    throw error;
+  }
+}
+
+function removeConfirmationPanel() {
+  const panel = document.getElementById('write-confirmation-panel');
+  if (panel) {
+    panel.remove();
+  }
+}
+
+function renderCreatedEntityLink(createdEntity) {
+  if (!createdEntity || !createdEntity.id) return '';
+
+  const doctype = createdEntity.doctype || 'Document';
+  const label = createdEntity.label || createdEntity.id;
+  const url = createdEntity.url || `/app/${doctype.toLowerCase().replace(/ /g, '-')}/${encodeURIComponent(createdEntity.id)}`;
+  const icon = getEntityIcon(doctype);
+
+  // Return HTML for inline display in the conversation
+  return `
+    <div style="margin-top: 12px; padding: 10px 14px; background: #d4edda; border: 1px solid #c3e6cb; border-radius: 6px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px;">
+      <div style="display: flex; align-items: center; gap: 8px; color: #155724;">
+        <span style="font-size: 18px;">✅</span>
+        <span><strong>${escapeHTML(doctype)}</strong> created successfully</span>
+      </div>
+      <a href="${escapeHTML(url)}" target="_blank" rel="noopener noreferrer"
+         class="btn btn-sm btn-success"
+         style="display: inline-flex; align-items: center; gap: 6px; text-decoration: none;">
+        <span>${icon}</span>
+        <span>Open ${escapeHTML(label)}</span>
+        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+          <polyline points="15 3 21 3 21 9"></polyline>
+          <line x1="10" y1="14" x2="21" y2="3"></line>
+        </svg>
+      </a>
+    </div>
+  `;
+}
+
+// Make confirmation functions globally available for potential external use
+window.handleConfirmAction = handleConfirmAction;
+window.showChangeInput = showChangeInput;
+window.hideChangeInput = hideChangeInput;
+window.submitChangeRequest = submitChangeRequest;

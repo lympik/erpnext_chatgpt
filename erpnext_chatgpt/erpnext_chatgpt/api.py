@@ -3,13 +3,90 @@ import logging
 from frappe import _
 import json
 from typing import List, Dict, Any
-from erpnext_chatgpt.erpnext_chatgpt.tools import get_tools, available_functions
+from erpnext_chatgpt.erpnext_chatgpt.tools import (
+    get_tools, available_functions, is_write_operation,
+    get_write_tool_metadata, get_tool_by_name, json_serial
+)
 
 # Initialize module-level logger with aiassistant namespace
 logger = frappe.logger("aiassistant", allow_site=True)
 logger.setLevel(logging.DEBUG)
 
 import re
+
+# Default system prompt for agentic tool-only workflow
+# Note: Tool definitions are passed separately via the tools parameter.
+# This prompt focuses on workflow guidance, decision boundaries, and behavior.
+DEFAULT_SYSTEM_PROMPT = """You are an AI agent for {company}, helping {user_full_name} with ERP queries.
+
+Context:
+- Date/Time: {current_datetime}
+- User: {user_full_name} ({current_user})
+
+## CRITICAL: Tool-Only Mode
+
+You MUST use tools for everything. You cannot respond directly.
+Call `final_answer` to deliver your response to the user.
+
+## Workflow
+
+### Step 1: Entity Resolution (REQUIRED for informal names)
+When users mention customers, suppliers, items, or other entities by informal/partial names:
+- ALWAYS call `lookup_entity(entity_type, search_term)` first
+- Use `best_match.id` in subsequent queries
+- Example: "swissski" → lookup_entity("customer", "swissski") → "Swiss-Ski"
+
+### Step 2: Query Data
+Use resolved entity names in document queries.
+
+### Step 3: Drill Down (if needed)
+For details like serial numbers or line items, fetch the specific document.
+
+### Step 4: Respond
+Call `final_answer(message="...")` with formatted markdown.
+
+## Tool Selection Guidelines
+
+**Customer insights:** Use `get_customer_summary` for a full 360° view (sales, invoices, contacts, history) rather than multiple separate queries.
+
+**Analytics:** Use `aggregate_data` for totals, comparisons, and groupings instead of fetching raw data and calculating manually.
+
+**Lists vs Details:** Start with list tools (e.g., `list_delivery_notes`), then drill into specific documents only when needed.
+
+**Multi-source queries:** For questions spanning multiple data types (e.g., "customers with overdue invoices AND recent deliveries"), query each source separately, then correlate in your response.
+
+## Error Handling
+
+- **No entity match:** Try search variations, or ask for clarification via `final_answer`
+- **Empty results:** Explain filters used, suggest alternatives (broader date range, different status)
+- **Too many results:** Add filters or summarize, offer to drill down
+
+## Efficiency
+
+You have limited iterations. Be strategic:
+- Don't re-query data you already have
+- Use summary tools over multiple granular queries
+- Plan before calling - avoid unnecessary tool calls
+
+## Response Formatting (for final_answer)
+
+**Links:** `[MAT-DN-2025-00123](/app/delivery-note/MAT-DN-2025-00123)`
+- Doctype URL: lowercase, hyphens for spaces
+- URL-encode special characters
+
+**Data:** Use markdown tables. Show summaries first, then details.
+
+**Currency:** €1,234.56 or CHF 1'234.56
+
+**Confirmation:** Always confirm matched entities: "Found customer 'Swiss-Ski' for 'swissski'"
+
+## Rules
+
+- NEVER skip entity lookup for informal names
+- NEVER respond without calling `final_answer`
+- If ambiguous, ask clarifying questions via `final_answer`
+"""
+
 
 def auto_link_document_ids(text):
     """
@@ -107,9 +184,9 @@ def get_system_instructions():
     # Get custom system instructions from settings
     custom_instructions = frappe.db.get_single_value("OpenAI Settings", "system_instructions")
 
-    # If no custom instructions are set, tell the user to configure them
+    # If no custom instructions are set, use the default agentic prompt
     if not custom_instructions or custom_instructions.strip() == "":
-        return "No system instructions are currently configured. Please go to the OpenAI Settings page to set up custom system instructions for the AI assistant."
+        custom_instructions = DEFAULT_SYSTEM_PROMPT
 
     # Build placeholder values - support multiple naming conventions
     placeholder_values = {
@@ -331,15 +408,17 @@ def extract_fetched_entities(function_name, response_data):
     return entities
 
 
-def handle_tool_calls(tool_calls: List[Any], conversation: List[Dict[str, Any]], tool_usage_log: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def handle_tool_calls(tool_calls: List[Any], conversation: List[Dict[str, Any]], tool_usage_log: List[Dict[str, Any]], session_doc=None) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
     """
     Handle the tool calls by executing the corresponding functions and appending the results to the conversation.
     Also track tool usage for transparency.
+    For write operations, returns a pending_confirmation response for user approval.
 
     :param tool_calls: List of tool calls from OpenAI
     :param conversation: Current conversation history
     :param tool_usage_log: List to track tool usage
-    :return: Tuple of updated conversation and tool usage log
+    :param session_doc: Optional session document for storing pending confirmations
+    :return: Tuple of (updated conversation, tool usage log, pending_confirmation or None)
     """
     for tool_call in tool_calls:
         function_name = tool_call.function.name
@@ -349,6 +428,32 @@ def handle_tool_calls(tool_calls: List[Any], conversation: List[Dict[str, Any]],
             raise ValueError(f"Function {function_name} not found.")
 
         function_args = json.loads(tool_call.function.arguments)
+
+        # Check if this is a write operation that requires user confirmation
+        if is_write_operation(function_name):
+            write_metadata = get_write_tool_metadata(function_name)
+            logger.debug(f"Write operation detected: {function_name}, requiring confirmation")
+
+            # Build pending confirmation data
+            pending_confirmation = {
+                'tool_call_id': tool_call.id,
+                'tool_name': function_name,
+                'parameters': function_args,
+                'confirmation_message': write_metadata.get('confirmation_message', f'Execute {function_name}'),
+                'conversation_state': conversation.copy(),
+                'tool_usage_log': tool_usage_log.copy(),
+                'created_at': frappe.utils.now()
+            }
+
+            # Save pending confirmation to session document if provided
+            if session_doc:
+                session_doc.pending_confirmation = json.dumps(pending_confirmation, default=json_serial)
+                session_doc.save(ignore_permissions=False)
+                frappe.db.commit()
+                logger.debug(f"Saved pending confirmation to session {session_doc.name}")
+
+            # Return early with pending confirmation
+            return conversation, tool_usage_log, pending_confirmation
 
         # Log the tool usage
         tool_usage_entry = {
@@ -437,7 +542,7 @@ def handle_tool_calls(tool_calls: List[Any], conversation: List[Dict[str, Any]],
             "name": function_name,
             "content": str(function_response),
         })
-    return conversation, tool_usage_log
+    return conversation, tool_usage_log, None  # No pending confirmation for read operations
 
 def estimate_token_count(messages: List[Dict[str, Any]]) -> int:
     """
@@ -637,7 +742,19 @@ def ask_openai_question(session_id: str, message: str) -> Dict[str, Any]:
 
             # No final_answer yet - handle the tool calls and continue
             conversation.append(response_message.model_dump())
-            conversation, tool_usage_log = handle_tool_calls(tool_calls, conversation, tool_usage_log)
+            conversation, tool_usage_log, pending_confirmation = handle_tool_calls(
+                tool_calls, conversation, tool_usage_log, session_doc
+            )
+
+            # Check if there's a pending write operation confirmation
+            if pending_confirmation:
+                logger.debug(f"Returning pending confirmation for {pending_confirmation['tool_name']}")
+                return {
+                    "status": "pending_confirmation",
+                    "pending_confirmation": pending_confirmation,
+                    "tool_usage": tool_usage_log,
+                    "session_id": session_doc.name if session_doc else None
+                }
 
             # Trim conversation if needed
             conversation = trim_conversation_to_token_limit(conversation, max_tokens)
@@ -965,3 +1082,391 @@ def delete_conversation(session_id: str) -> Dict[str, Any]:
     except Exception as e:
         frappe.log_error(message=str(e), title="Delete Conversation Error")
         return {"success": False, "error": str(e)}
+
+
+# =============================================================================
+# Write Operation Confirmation API
+# =============================================================================
+
+@frappe.whitelist()
+def confirm_write_operation(session_id: str, action: str, user_message: str = None) -> Dict[str, Any]:
+    """
+    Handle user's confirmation choice for a pending write operation.
+
+    :param session_id: The conversation session ID
+    :param action: One of "accept", "change", or "deny"
+    :param user_message: If action is "change", the user's feedback for what to change
+    :return: Dictionary with result or continued conversation response
+    """
+    try:
+        if not session_id:
+            return {"error": "session_id is required", "tool_usage": []}
+
+        if action not in ["accept", "change", "deny"]:
+            return {"error": f"Invalid action: {action}. Must be 'accept', 'change', or 'deny'", "tool_usage": []}
+
+        # Load session
+        session_doc = frappe.get_doc("AI Conversation", session_id)
+
+        # Check permission
+        if session_doc.owner != frappe.session.user and "System Manager" not in frappe.get_roles():
+            frappe.throw("You don't have permission to access this conversation")
+
+        # Get pending confirmation
+        if not session_doc.pending_confirmation:
+            return {"error": "No pending confirmation found for this session", "tool_usage": []}
+
+        pending = json.loads(session_doc.pending_confirmation)
+        tool_name = pending.get('tool_name')
+        tool_args = pending.get('parameters', {})
+        conversation = pending.get('conversation_state', [])
+        tool_usage_log = pending.get('tool_usage_log', [])
+        tool_call_id = pending.get('tool_call_id')
+
+        logger.debug(f"Processing confirmation action '{action}' for tool '{tool_name}'")
+
+        # Clear pending confirmation
+        session_doc.pending_confirmation = None
+
+        if action == "accept":
+            # Execute the write operation
+            function_to_call = available_functions.get(tool_name)
+            if not function_to_call:
+                return {"error": f"Function {tool_name} not found", "tool_usage": tool_usage_log}
+
+            try:
+                function_response = function_to_call(**tool_args)
+
+                # Parse response
+                try:
+                    response_data = json.loads(function_response)
+                except:
+                    response_data = {}
+
+                # Extract created entity info for frontend display
+                created_entity = _extract_created_entity(tool_name, response_data)
+
+                # Log the tool usage
+                tool_usage_entry = {
+                    "tool_name": tool_name,
+                    "parameters": tool_args,
+                    "timestamp": frappe.utils.now(),
+                    "status": "success",
+                    "result_summary": f"Executed {tool_name} successfully",
+                    "user_confirmed": True
+                }
+                tool_usage_log.append(tool_usage_entry)
+
+                # Add tool response to conversation
+                conversation.append({
+                    "tool_call_id": tool_call_id,
+                    "role": "tool",
+                    "name": tool_name,
+                    "content": str(function_response),
+                })
+
+                # Save session and continue agentic loop
+                session_doc.save(ignore_permissions=False)
+                frappe.db.commit()
+
+                # Continue the agentic loop from where we left off
+                result = _continue_agentic_loop(session_doc, conversation, tool_usage_log)
+
+                # Add created entity info to the response for frontend display
+                if created_entity:
+                    result['created_entity'] = created_entity
+
+                return result
+
+            except Exception as e:
+                logger.error(f"Error executing {tool_name}: {str(e)}")
+                frappe.log_error(f"Error executing {tool_name}: {str(e)}", "Write Operation Error")
+                return {
+                    "error": f"Failed to execute {tool_name}: {str(e)}",
+                    "tool_usage": tool_usage_log,
+                    "session_id": session_id
+                }
+
+        elif action == "change":
+            # User wants to modify the parameters
+            if not user_message:
+                return {"error": "user_message is required for 'change' action", "tool_usage": tool_usage_log}
+
+            # Add a user message with the change request to the conversation
+            change_message = f"Please change the following before proceeding: {user_message}"
+            conversation.append({"role": "user", "content": change_message})
+
+            # Add a note to the tool response indicating it was rejected for changes
+            conversation.append({
+                "tool_call_id": tool_call_id,
+                "role": "tool",
+                "name": tool_name,
+                "content": json.dumps({
+                    "status": "rejected_for_changes",
+                    "user_feedback": user_message,
+                    "message": f"User requested changes before executing {tool_name}. Please revise the parameters based on their feedback and try again."
+                }),
+            })
+
+            # Save session state
+            session_doc.save(ignore_permissions=False)
+            frappe.db.commit()
+
+            # Continue the agentic loop - AI will re-plan
+            return _continue_agentic_loop(session_doc, conversation, tool_usage_log)
+
+        elif action == "deny":
+            # User denied the operation
+            # Add a tool response indicating denial
+            conversation.append({
+                "tool_call_id": tool_call_id,
+                "role": "tool",
+                "name": tool_name,
+                "content": json.dumps({
+                    "status": "denied",
+                    "message": f"User denied the {tool_name} operation. Do not attempt this action again unless explicitly asked."
+                }),
+            })
+
+            # Log the denial
+            tool_usage_entry = {
+                "tool_name": tool_name,
+                "parameters": tool_args,
+                "timestamp": frappe.utils.now(),
+                "status": "denied",
+                "result_summary": f"User denied {tool_name}",
+                "user_confirmed": False
+            }
+            tool_usage_log.append(tool_usage_entry)
+
+            # Save session state
+            session_doc.save(ignore_permissions=False)
+            frappe.db.commit()
+
+            # Continue the agentic loop - AI should acknowledge the denial
+            return _continue_agentic_loop(session_doc, conversation, tool_usage_log)
+
+    except frappe.DoesNotExistError:
+        return {"error": "Conversation session not found", "tool_usage": []}
+    except Exception as e:
+        frappe.log_error(message=str(e), title="Confirm Write Operation Error")
+        return {"error": str(e), "tool_usage": [], "session_id": session_id}
+
+
+def _extract_created_entity(tool_name: str, response_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Extract created entity information from a write operation response.
+    Returns entity info for frontend to display a quick link.
+    """
+    if not response_data or not response_data.get('success'):
+        return None
+
+    # Map tool names to their entity info extraction
+    entity_extractors = {
+        'create_lead': lambda data: {
+            'id': data.get('lead_id'),
+            'doctype': 'Lead',
+            'label': data.get('lead_name') or data.get('lead_id'),
+            'url': f"/app/lead/{data.get('lead_id')}"
+        } if data.get('lead_id') else None,
+        # Add more extractors here as new write operations are added
+        # 'create_customer': lambda data: {...},
+        # 'create_opportunity': lambda data: {...},
+    }
+
+    extractor = entity_extractors.get(tool_name)
+    if extractor:
+        try:
+            return extractor(response_data)
+        except Exception as e:
+            logger.warning(f"Error extracting entity from {tool_name} response: {e}")
+            return None
+
+    return None
+
+
+def _continue_agentic_loop(session_doc, conversation: List[Dict[str, Any]], tool_usage_log: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Continue the agentic loop from a given conversation state.
+    Used after handling write operation confirmations.
+    """
+    try:
+        client = get_openai_client()
+        model, max_tokens = get_model_settings()
+        tools = get_tools()
+
+        # Add system instructions if not present
+        if not conversation or conversation[0].get("role") != "system":
+            conversation.insert(0, {"role": "system", "content": get_system_instructions()})
+
+        # Trim conversation
+        conversation = trim_conversation_to_token_limit(conversation, max_tokens)
+
+        max_iterations = 15
+        iteration = 0
+
+        while iteration < max_iterations:
+            iteration += 1
+
+            response = client.chat.completions.create(
+                model=model,
+                messages=conversation,
+                tools=tools,
+                tool_choice="required"
+            )
+
+            response_message = response.choices[0].message
+            logger.debug(f"_continue_agentic_loop response (iteration {iteration}): {response_message}")
+
+            tool_calls = response_message.tool_calls
+            if not tool_calls:
+                logger.warning("No tool calls returned despite tool_choice=required in continuation")
+                response_data = response_message.model_dump()
+                response_data['tool_usage'] = tool_usage_log
+                return response_data
+
+            # Check for final_answer
+            for tool_call in tool_calls:
+                if tool_call.function.name == "final_answer":
+                    try:
+                        final_args = json.loads(tool_call.function.arguments)
+                        logger.debug(f"Final answer received after {iteration} continuation iterations")
+
+                        # Auto-link document IDs
+                        message = final_args.get("message", "")
+                        message = auto_link_document_ids(message)
+
+                        # Build context summary
+                        context_parts = []
+                        for tool_entry in tool_usage_log:
+                            tool_name = tool_entry.get("tool_name", "")
+                            params = tool_entry.get("parameters", {})
+                            if params and tool_name != "final_answer":
+                                param_str = ", ".join(f"{k}={v}" for k, v in params.items() if v is not None)
+                                context_parts.append(f"{tool_name}({param_str})")
+
+                        if context_parts:
+                            context_note = "\n\n<!-- CONTEXT: " + " | ".join(context_parts) + " -->"
+                            message_with_context = message + context_note
+                        else:
+                            message_with_context = message
+
+                        # Add assistant response
+                        assistant_message = {
+                            "role": "assistant",
+                            "content": message_with_context,
+                            "content_display": message,
+                            "tool_usage": tool_usage_log
+                        }
+                        conversation.append(assistant_message)
+
+                        # Save conversation
+                        messages_to_save = extract_messages_for_storage(conversation)
+                        session_doc.messages = json.dumps(messages_to_save)
+                        session_doc.model_used = model
+                        session_doc.save(ignore_permissions=False)
+                        frappe.db.commit()
+
+                        return {
+                            "role": "assistant",
+                            "content": message_with_context,
+                            "content_display": message,
+                            "tool_usage": tool_usage_log,
+                            "summary": final_args.get("summary"),
+                            "iterations": iteration,
+                            "session_id": session_doc.name
+                        }
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Failed to parse final_answer arguments: {e}")
+                        return {
+                            "role": "assistant",
+                            "content": "I encountered an error formatting my response.",
+                            "tool_usage": tool_usage_log,
+                            "error": str(e),
+                            "session_id": session_doc.name
+                        }
+
+            # Handle tool calls (may return pending confirmation)
+            conversation.append(response_message.model_dump())
+            conversation, tool_usage_log, pending_confirmation = handle_tool_calls(
+                tool_calls, conversation, tool_usage_log, session_doc
+            )
+
+            if pending_confirmation:
+                logger.debug(f"Returning pending confirmation for {pending_confirmation['tool_name']} in continuation")
+                return {
+                    "status": "pending_confirmation",
+                    "pending_confirmation": pending_confirmation,
+                    "tool_usage": tool_usage_log,
+                    "session_id": session_doc.name
+                }
+
+            conversation = trim_conversation_to_token_limit(conversation, max_tokens)
+            logger.debug(f"Handled {len(tool_calls)} tool calls in continuation, iteration {iteration}")
+
+        # Hit max iterations
+        logger.warning(f"Hit max iterations ({max_iterations}) in continuation without final_answer")
+        error_message = "I was unable to complete the request within the allowed number of steps."
+        conversation.append({
+            "role": "assistant",
+            "content": error_message,
+            "tool_usage": tool_usage_log
+        })
+
+        messages_to_save = extract_messages_for_storage(conversation)
+        session_doc.messages = json.dumps(messages_to_save)
+        session_doc.model_used = model
+        session_doc.save(ignore_permissions=False)
+        frappe.db.commit()
+
+        return {
+            "role": "assistant",
+            "content": error_message,
+            "tool_usage": tool_usage_log,
+            "error": "max_iterations_reached",
+            "session_id": session_doc.name
+        }
+
+    except Exception as e:
+        frappe.log_error(message=str(e), title="Continue Agentic Loop Error")
+        return {"error": str(e), "tool_usage": tool_usage_log, "session_id": session_doc.name if session_doc else None}
+
+
+@frappe.whitelist()
+def get_pending_confirmation(session_id: str) -> Dict[str, Any]:
+    """
+    Check if there's a pending write confirmation for a session.
+    Used when reopening a chat dialog to restore pending state.
+
+    :param session_id: The conversation session ID
+    :return: Dictionary with pending confirmation data or None
+    """
+    try:
+        if not session_id:
+            return {"pending_confirmation": None}
+
+        session_doc = frappe.get_doc("AI Conversation", session_id)
+
+        # Check permission
+        if session_doc.owner != frappe.session.user and "System Manager" not in frappe.get_roles():
+            frappe.throw("You don't have permission to access this conversation")
+
+        if session_doc.pending_confirmation:
+            pending = json.loads(session_doc.pending_confirmation)
+            return {
+                "pending_confirmation": {
+                    "tool_name": pending.get('tool_name'),
+                    "parameters": pending.get('parameters'),
+                    "confirmation_message": pending.get('confirmation_message'),
+                    "created_at": pending.get('created_at')
+                },
+                "session_id": session_id
+            }
+
+        return {"pending_confirmation": None, "session_id": session_id}
+
+    except frappe.DoesNotExistError:
+        return {"error": "Conversation session not found", "pending_confirmation": None}
+    except Exception as e:
+        frappe.log_error(message=str(e), title="Get Pending Confirmation Error")
+        return {"error": str(e), "pending_confirmation": None}

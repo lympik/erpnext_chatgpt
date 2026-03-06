@@ -2426,7 +2426,9 @@ create_lead_tool = {
             },
             "required": []
         }
-    }
+    },
+    "_is_write_operation": True,
+    "_confirmation_message": "Create a new lead"
 }
 
 
@@ -3149,6 +3151,72 @@ Use this for quick customer overview. For FULL record lists, use specific tools:
         }
     }
 }
+
+
+# Set of write operation tool names for quick lookup
+WRITE_TOOLS = {'create_lead'}
+
+
+def get_tool_by_name(tool_name):
+    """
+    Get the tool definition dict by name.
+    Used to check metadata like _is_write_operation.
+    """
+    tool_map = {
+        'final_answer': final_answer_tool,
+        'lookup_entity': lookup_entity_tool,
+        'get_sales_invoices': get_sales_invoices_tool,
+        'get_sales_invoice': get_sales_invoice_tool,
+        'list_invoices': list_invoices_tool,
+        'get_employees': get_employees_tool,
+        'get_purchase_orders': get_purchase_orders_tool,
+        'get_customers': get_customers_tool,
+        'list_customers': list_customers_tool,
+        'get_stock_levels': get_stock_levels_tool,
+        'get_general_ledger_entries': get_general_ledger_entries_tool,
+        'get_profit_and_loss_statement': get_profit_and_loss_statement_tool,
+        'get_outstanding_invoices': get_outstanding_invoices_tool,
+        'get_sales_orders': get_sales_orders_tool,
+        'list_quotations': list_quotations_tool,
+        'list_sales_orders': list_sales_orders_tool,
+        'list_delivery_notes': list_delivery_notes_tool,
+        'get_delivery_note': get_delivery_note_tool,
+        'get_purchase_invoices': get_purchase_invoices_tool,
+        'get_journal_entries': get_journal_entries_tool,
+        'get_payments': get_payments_tool,
+        'list_service_protocols': list_service_protocols_tool,
+        'get_service_protocol': get_service_protocol_tool,
+        'create_lead': create_lead_tool,
+        'get_top_customers_by_sales': get_top_customers_by_sales_tool,
+        'aggregate_data': aggregate_data_tool,
+        'get_customer_summary': get_customer_summary_tool,
+    }
+    return tool_map.get(tool_name)
+
+
+def is_write_operation(tool_name):
+    """
+    Check if a tool is a write operation that requires user confirmation.
+    """
+    return tool_name in WRITE_TOOLS
+
+
+def get_write_tool_metadata(tool_name):
+    """
+    Get metadata for a write tool (confirmation message, etc.).
+    Returns None if not a write tool.
+    """
+    if not is_write_operation(tool_name):
+        return None
+
+    tool = get_tool_by_name(tool_name)
+    if not tool:
+        return None
+
+    return {
+        'confirmation_message': tool.get('_confirmation_message', f'Execute {tool_name}'),
+        'is_write_operation': tool.get('_is_write_operation', False)
+    }
 
 
 def get_tools():

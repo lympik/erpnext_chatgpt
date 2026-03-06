@@ -16,10 +16,10 @@
       "fieldname": "model",
       "fieldtype": "Select",
       "label": "Model",
-      "options": "gpt-4o-mini\ngpt-4o\ngpt-4.1\ngpt-4.1-mini\ngpt-5-mini\ngpt-5.1\ngpt-5.2\ngpt-3.5-turbo\ngpt-4\ngpt-4-turbo",
-      "default": "gpt-4o-mini",
+      "options": "gpt-4.1\ngpt-4o\ngpt-4o-mini\no4-mini\no3\no3-mini\no3-pro\ngpt-4-turbo\ngpt-3.5-turbo",
+      "default": "gpt-4.1",
       "reqd": 1,
-      "description": "Select the OpenAI model to use. GPT-4o-mini recommended for balance of cost and capability. GPT-5.2 is the latest flagship model."
+      "description": "Select the OpenAI model. GPT-4.1 is the smartest non-reasoning model. o3/o4-mini are reasoning models for complex tasks."
     },
     {
       "fieldname": "max_tokens",
