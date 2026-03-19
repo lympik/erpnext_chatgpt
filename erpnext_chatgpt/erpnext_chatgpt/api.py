@@ -333,7 +333,22 @@ def get_anthropic_client():
 def get_api_provider():
     """Get the configured API provider (openai or anthropic)."""
     provider = frappe.db.get_single_value("OpenAI Settings", "api_provider")
-    return provider or "anthropic"  # Default to anthropic
+    logger.debug(f"API Provider from settings: '{provider}'")
+
+    # Handle None or empty string
+    if not provider:
+        logger.debug("No provider set, defaulting to anthropic")
+        return "anthropic"
+
+    # Normalize the value (lowercase, strip whitespace)
+    provider = provider.strip().lower()
+
+    # Validate provider
+    if provider not in ("anthropic", "openai"):
+        logger.warning(f"Unknown provider '{provider}', defaulting to anthropic")
+        return "anthropic"
+
+    return provider
 
 
 def analyze_tool_result(function_name, result_str):
@@ -1149,7 +1164,7 @@ def ask_openai_question(session_id: str, message: str) -> Dict[str, Any]:
         # Trim conversation to stay within the token limit
         conversation = trim_conversation_to_token_limit(conversation, max_tokens)
 
-        logger.debug(f"Conversation (provider={provider}): {json.dumps(conversation)}")
+        logger.info(f"[ROUTING] Provider='{provider}', Model='{model}', routing to {'Claude' if provider == 'anthropic' else 'OpenAI'}")
 
         # Route to appropriate provider
         if provider == "anthropic":
