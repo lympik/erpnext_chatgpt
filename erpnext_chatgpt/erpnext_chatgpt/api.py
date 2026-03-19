@@ -255,13 +255,11 @@ def get_model_settings():
     # These are conservative limits for conversation context management
     model_token_defaults = {
         # Claude models (200K context window - use 150K for safety)
-        "claude-opus-4-5-20250514": 150000,
+        "claude-opus-4-20250514": 150000,
         "claude-sonnet-4-20250514": 150000,
-        "claude-sonnet-4-5-20250514": 150000,
         "claude-3-5-sonnet-20241022": 150000,
         "claude-3-5-haiku-20241022": 150000,
         # GPT-4 models (128K context window - use 100K for safety)
-        "gpt-4.1": 100000,
         "gpt-4o": 100000,
         "gpt-4-turbo": 100000,
         # GPT-4 mini (128K but use less for cost efficiency)
@@ -280,16 +278,14 @@ def get_model_settings():
 def get_model_output_limit(model: str) -> int:
     """Get the maximum output tokens for a model."""
     output_limits = {
-        # Claude Sonnet 4 models support up to 64K output
+        # Claude Sonnet 4 supports up to 64K output
         "claude-sonnet-4-20250514": 16000,
-        "claude-sonnet-4-5-20250514": 16000,
-        # Claude Opus supports up to 32K output
-        "claude-opus-4-5-20250514": 16000,
+        # Claude Opus 4 supports up to 32K output
+        "claude-opus-4-20250514": 16000,
         # Older Claude models
         "claude-3-5-sonnet-20241022": 8192,
         "claude-3-5-haiku-20241022": 8192,
         # GPT-4 models
-        "gpt-4.1": 16384,
         "gpt-4o": 16384,
         "gpt-4-turbo": 4096,
         "gpt-4o-mini": 16384,
@@ -1401,38 +1397,61 @@ def get_available_models() -> List[str]:
 @frappe.whitelist()
 def test_connection() -> Dict[str, Any]:
     """
-    Test the OpenAI connection by initializing the client and making a simple API call.
+    Test the API connection by initializing the client and making a simple API call.
+    Supports both Anthropic and OpenAI providers.
 
     :return: Dictionary with success status and message.
     """
     try:
-        # Get the API key from settings using get_password for Password fieldtype
+        # Get settings
         settings = frappe.get_single("OpenAI Settings")
         api_key = settings.get_password("api_key")
         if not api_key:
             return {"success": False, "message": _("API key is not set. Please enter an API key first.")}
 
-        # Import OpenAI
-        from openai import OpenAI
+        provider = get_api_provider()
+        model, _ = get_model_settings()
 
-        # Simple initialization with just API key
-        # httpx==0.27.2 handles proxies correctly
-        client = OpenAI(api_key=api_key)
+        if provider == "anthropic":
+            # Test Anthropic/Claude connection
+            from anthropic import Anthropic
 
-        # Test the connection by listing models
-        models = list(client.models.list())
+            client = Anthropic(api_key=api_key)
 
-        if models:
-            return {"success": True, "message": _("Connection successful! OpenAI API is working correctly.")}
+            # Make a minimal test request
+            response = client.messages.create(
+                model=model,
+                max_tokens=10,
+                messages=[{"role": "user", "content": "Hi"}]
+            )
+
+            if response and response.content:
+                return {"success": True, "message": _("Connection successful! Claude API is working correctly. Model: {0}").format(model)}
+            else:
+                return {"success": False, "message": _("Connection established but no response received.")}
+
         else:
-            return {"success": False, "message": _("Connection established but no models available.")}
+            # Test OpenAI connection
+            from openai import OpenAI
+
+            client = OpenAI(api_key=api_key)
+
+            # Test the connection by listing models
+            models = list(client.models.list())
+
+            if models:
+                return {"success": True, "message": _("Connection successful! OpenAI API is working correctly.")}
+            else:
+                return {"success": False, "message": _("Connection established but no models available.")}
 
     except Exception as e:
-        frappe.log_error(str(e), "OpenAI Connection Test Failed")
+        frappe.log_error(str(e), "API Connection Test Failed")
 
-        # Provide specific error messages
-        if "api" in str(e).lower() and "key" in str(e).lower():
-            return {"success": False, "message": _("Invalid API key. Please check your OpenAI API key.")}
+        error_str = str(e).lower()
+        if "api" in error_str and "key" in error_str:
+            return {"success": False, "message": _("Invalid API key. Please check your API key.")}
+        elif "model" in error_str and "not_found" in error_str:
+            return {"success": False, "message": _("Invalid model. Please select a valid model for your provider.")}
         else:
             return {"success": False, "message": _("Connection failed: {0}").format(str(e))}
 

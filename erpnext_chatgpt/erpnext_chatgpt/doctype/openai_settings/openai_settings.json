@@ -26,7 +26,7 @@
       "fieldname": "model",
       "fieldtype": "Select",
       "label": "Model",
-      "options": "claude-sonnet-4-20250514 (Recommended - Fast & Capable)\nclaude-opus-4-5-20250514 (Most Intelligent)\nclaude-sonnet-4-5-20250514 (Latest Sonnet)\nclaude-3-5-sonnet-20241022 (Previous Sonnet)\nclaude-3-5-haiku-20241022 (Fastest & Cheapest)\ngpt-4.1 (Latest GPT-4)\ngpt-4o (Fast GPT-4)\ngpt-4o-mini (Budget GPT-4)\ngpt-4-turbo (GPT-4 Turbo)\no3-mini (Reasoning - Fast)\no4-mini (Reasoning - Latest)",
+      "options": "claude-sonnet-4-20250514 (Recommended - Fast & Capable)\nclaude-opus-4-20250514 (Most Intelligent)\nclaude-3-5-sonnet-20241022 (Previous Sonnet)\nclaude-3-5-haiku-20241022 (Fastest & Cheapest)\ngpt-4o (Fast GPT-4)\ngpt-4o-mini (Budget GPT-4)\ngpt-4-turbo (GPT-4 Turbo)\no3-mini (Reasoning - Fast)\no4-mini (Reasoning - Latest)",
       "default": "claude-sonnet-4-20250514 (Recommended - Fast & Capable)",
       "reqd": 1,
       "description": "Select the model. Max tokens will be set automatically based on model capabilities."
