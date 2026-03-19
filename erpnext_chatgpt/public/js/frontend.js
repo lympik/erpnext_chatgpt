@@ -2,12 +2,15 @@
 document.addEventListener("DOMContentLoaded", initializeChat);
 
 // Version marker for debugging - remove after testing
-console.log("ERPNext ChatGPT Frontend loaded - v2.0 with write confirmation support");
+console.log("ERPNext ChatGPT Frontend loaded - v2.2 with SSE streaming support");
 
 // Session-based conversation state
 let currentSessionId = null;
 let conversation = []; // Local display cache
 let pendingConfirmation = null; // Stores pending write operation confirmation
+let currentAbortController = null; // For canceling in-flight requests
+let currentEventSource = null; // For SSE streaming
+let streamingToolUsage = []; // Track tool usage during streaming
 
 async function initializeChat() {
   await loadMarkedJs();
@@ -281,8 +284,9 @@ window.handleAskButtonClick = function() {
   // Clear the input immediately after getting the question
   input.value = "";
 
-  // Call askQuestion which will handle disabling/enabling
-  askQuestion(question);
+  // Use streaming by default to prevent timeout issues
+  // Falls back to regular request if EventSource is unavailable
+  askQuestionStreaming(question);
 }
 
 // Make startNewConversation globally available
@@ -484,10 +488,23 @@ async function askQuestion(question) {
   const input = document.getElementById("question");
   const askButton = document.getElementById("askButton");
 
-  // Disable input and button while loading
+  // Create an AbortController for this request
+  currentAbortController = new AbortController();
+
+  // Disable input while loading, but keep button enabled for stopping
   input.disabled = true;
-  askButton.disabled = true;
-  askButton.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> Processing...';
+  askButton.disabled = false;
+  askButton.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> Stop';
+  askButton.classList.remove('btn-primary');
+  askButton.classList.add('btn-danger');
+
+  // Replace click handler temporarily to handle stop
+  const originalHandler = askButton.onclick;
+  askButton.onclick = () => {
+    if (currentAbortController) {
+      currentAbortController.abort();
+    }
+  };
 
   // Add user message to local display
   conversation.push({ role: "user", content: question });
@@ -512,6 +529,7 @@ async function askQuestion(question) {
           session_id: currentSessionId,
           message: question
         }),
+        signal: currentAbortController.signal
       }
     );
 
@@ -591,23 +609,453 @@ async function askQuestion(question) {
 
   } catch (error) {
     console.error("Error in askQuestion:", error);
-    // Remove the user message if there was an error
-    conversation.pop();
-    document.getElementById("answer").innerHTML += `
-      <div class="alert alert-danger" role="alert">
-        Error: ${error.message}. Please try again later.
-      </div>
-    `;
+
+    // Check if this was an abort (user clicked Stop)
+    if (error.name === 'AbortError') {
+      // Remove the user message since the request was cancelled
+      conversation.pop();
+      displayConversation(conversation);
+
+      // Show a subtle notification that the request was stopped
+      const answerDiv = document.getElementById("answer");
+      const stoppedNotice = document.createElement('div');
+      stoppedNotice.className = 'alert alert-secondary';
+      stoppedNotice.style.cssText = 'opacity: 0.8; font-size: 13px;';
+      stoppedNotice.innerHTML = '<em>Request stopped by user</em>';
+      answerDiv.appendChild(stoppedNotice);
+
+      // Remove the notice after a few seconds
+      setTimeout(() => {
+        if (stoppedNotice.parentNode) {
+          stoppedNotice.remove();
+        }
+      }, 3000);
+    } else {
+      // Remove the user message if there was an error
+      conversation.pop();
+      document.getElementById("answer").innerHTML += `
+        <div class="alert alert-danger" role="alert">
+          Error: ${error.message}. Please try again later.
+        </div>
+      `;
+    }
   } finally {
-    // Re-enable input and button
+    // Clear the abort controller
+    currentAbortController = null;
+
+    // Re-enable input and restore button
     input.disabled = false;
     askButton.disabled = false;
     askButton.innerHTML = 'Ask';
+    askButton.classList.remove('btn-danger');
+    askButton.classList.add('btn-primary');
+
+    // Restore original click handler
+    askButton.onclick = null;
 
     // Focus back on input for convenience
     input.focus();
   }
 }
+
+
+// =============================================================================
+// SSE Streaming Support
+// =============================================================================
+
+/**
+ * Ask a question using Server-Sent Events for real-time streaming.
+ * Falls back to regular askQuestion if SSE is unavailable.
+ */
+async function askQuestionStreaming(question) {
+  // Check if EventSource is supported
+  if (typeof EventSource === 'undefined') {
+    console.log("EventSource not supported, falling back to regular request");
+    return askQuestion(question);
+  }
+
+  const input = document.getElementById("question");
+  const askButton = document.getElementById("askButton");
+
+  // Reset streaming state
+  streamingToolUsage = [];
+
+  // Disable input while loading
+  input.disabled = true;
+  askButton.disabled = false;
+  askButton.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> Stop';
+  askButton.classList.remove('btn-primary');
+  askButton.classList.add('btn-danger');
+
+  // Add user message to local display
+  conversation.push({ role: "user", content: question });
+  displayConversation(conversation);
+
+  // Create streaming progress panel
+  const progressPanel = createStreamingProgressPanel();
+  const answerDiv = document.getElementById("answer");
+  answerDiv.appendChild(progressPanel);
+  scrollToBottom();
+
+  try {
+    // Ensure we have a session ID
+    if (!currentSessionId) {
+      await createNewConversation();
+    }
+
+    // Build SSE URL with query params
+    const sseUrl = `/api/method/erpnext_chatgpt.erpnext_chatgpt.api.ask_openai_question_stream?` +
+      `session_id=${encodeURIComponent(currentSessionId)}` +
+      `&message=${encodeURIComponent(question)}` +
+      `&csrf_token=${encodeURIComponent(frappe.csrf_token)}`;
+
+    // Create EventSource
+    currentEventSource = new EventSource(sseUrl);
+
+    // Set up stop button handler
+    askButton.onclick = () => {
+      if (currentEventSource) {
+        currentEventSource.close();
+        cleanupStreaming("Stopped by user");
+      }
+    };
+
+    // Handle SSE events
+    currentEventSource.addEventListener('connected', (event) => {
+      const data = JSON.parse(event.data);
+      console.log("SSE Connected:", data);
+      updateStreamingProgress("Connected", `Using ${data.model || 'AI model'}`);
+    });
+
+    currentEventSource.addEventListener('iteration_start', (event) => {
+      const data = JSON.parse(event.data);
+      console.log("Iteration start:", data);
+      updateStreamingProgress(
+        `Iteration ${data.iteration}/${data.max_iterations}`,
+        `${data.tools_called_so_far} tool calls so far`
+      );
+    });
+
+    currentEventSource.addEventListener('tool_start', (event) => {
+      const data = JSON.parse(event.data);
+      console.log("Tool start:", data);
+
+      const toolDisplay = data.is_thinking ? '🧠 Thinking...' : `Running: ${formatToolName(data.tool_name)}...`;
+      updateStreamingProgress(toolDisplay, null, true);
+
+      // Add to tool list in progress panel
+      addToolToProgressList(data.tool_name, 'running', data.is_thinking);
+    });
+
+    currentEventSource.addEventListener('tool_complete', (event) => {
+      const data = JSON.parse(event.data);
+      console.log("Tool complete:", data);
+
+      // Update tool in progress list
+      updateToolInProgressList(
+        data.tool_name,
+        data.status,
+        data.result_summary || (data.status === 'error' ? data.error : null)
+      );
+
+      // Track tool usage for final message
+      streamingToolUsage.push({
+        tool_name: data.tool_name,
+        status: data.status,
+        result_summary: data.result_summary,
+        is_thinking: data.is_thinking,
+        error: data.error
+      });
+    });
+
+    currentEventSource.addEventListener('thinking', (event) => {
+      const data = JSON.parse(event.data);
+      console.log("Thinking:", data);
+      updateStreamingProgress('🧠 ' + (data.reasoning || 'Analyzing...'), null);
+    });
+
+    currentEventSource.addEventListener('final_answer', (event) => {
+      const data = JSON.parse(event.data);
+      console.log("Final answer received:", data);
+
+      // Close the EventSource
+      if (currentEventSource) {
+        currentEventSource.close();
+        currentEventSource = null;
+      }
+
+      // Remove progress panel
+      removeStreamingProgressPanel();
+
+      // Add assistant message to conversation
+      conversation.push({
+        role: "assistant",
+        content: data.content,
+        content_display: data.content_display || data.content,
+        tool_usage: data.tool_usage || streamingToolUsage
+      });
+
+      // Update session ID if returned
+      if (data.session_id) {
+        currentSessionId = data.session_id;
+        localStorage.setItem("lastAISessionId", currentSessionId);
+      }
+
+      displayConversation(conversation);
+      restoreInputState();
+
+      // Update title after first message
+      if (conversation.filter(m => m.role === "user").length === 1) {
+        updateConversationTitle(question.length > 40 ? question.substring(0, 37) + "..." : question);
+      }
+    });
+
+    currentEventSource.addEventListener('pending_confirmation', (event) => {
+      const data = JSON.parse(event.data);
+      console.log("Pending confirmation:", data);
+
+      // Close the EventSource
+      if (currentEventSource) {
+        currentEventSource.close();
+        currentEventSource = null;
+      }
+
+      // Remove progress panel
+      removeStreamingProgressPanel();
+
+      // Update session ID if returned
+      if (data.session_id) {
+        currentSessionId = data.session_id;
+        localStorage.setItem("lastAISessionId", currentSessionId);
+      }
+
+      // Store and display confirmation
+      pendingConfirmation = data.pending_confirmation;
+      renderWriteConfirmation(pendingConfirmation);
+      restoreInputState();
+    });
+
+    currentEventSource.addEventListener('limit_reached', (event) => {
+      const data = JSON.parse(event.data);
+      console.log("Limit reached:", data);
+
+      // Close the EventSource
+      if (currentEventSource) {
+        currentEventSource.close();
+        currentEventSource = null;
+      }
+
+      // Remove progress panel
+      removeStreamingProgressPanel();
+
+      // Update session ID if returned
+      if (data.session_id) {
+        currentSessionId = data.session_id;
+        localStorage.setItem("lastAISessionId", currentSessionId);
+      }
+
+      renderLimitReachedUI(data);
+      restoreInputState();
+    });
+
+    currentEventSource.addEventListener('error', (event) => {
+      let errorData;
+      try {
+        errorData = JSON.parse(event.data);
+      } catch {
+        errorData = { error: 'Connection error' };
+      }
+      console.error("SSE Error:", errorData);
+
+      // Close the EventSource
+      if (currentEventSource) {
+        currentEventSource.close();
+        currentEventSource = null;
+      }
+
+      cleanupStreaming(`Error: ${errorData.error || 'Unknown error'}`);
+    });
+
+    // Handle connection errors
+    currentEventSource.onerror = (event) => {
+      console.error("EventSource error:", event);
+
+      // Check if connection was closed intentionally
+      if (currentEventSource && currentEventSource.readyState === EventSource.CLOSED) {
+        return;
+      }
+
+      // Close the EventSource
+      if (currentEventSource) {
+        currentEventSource.close();
+        currentEventSource = null;
+      }
+
+      cleanupStreaming("Connection lost. Please try again.");
+    };
+
+  } catch (error) {
+    console.error("Error in askQuestionStreaming:", error);
+    cleanupStreaming(`Error: ${error.message}`);
+  }
+}
+
+/**
+ * Create the streaming progress panel UI
+ */
+function createStreamingProgressPanel() {
+  const panel = document.createElement('div');
+  panel.id = 'streaming-progress-panel';
+  panel.className = 'alert alert-light';
+  panel.style.cssText = 'border-left: 4px solid #007bff; margin-bottom: 0;';
+  panel.innerHTML = `
+    <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 8px;">
+      <span class="spinner-border spinner-border-sm text-primary" role="status"></span>
+      <span id="streaming-status" style="font-weight: 500;">Connecting...</span>
+    </div>
+    <div id="streaming-substatus" style="font-size: 12px; color: #666; margin-bottom: 8px;"></div>
+    <div id="streaming-tool-list" style="font-size: 12px; max-height: 150px; overflow-y: auto;"></div>
+  `;
+  return panel;
+}
+
+/**
+ * Update the streaming progress display
+ */
+function updateStreamingProgress(status, substatus = null, showSpinner = true) {
+  const statusEl = document.getElementById('streaming-status');
+  const substatusEl = document.getElementById('streaming-substatus');
+
+  if (statusEl) {
+    statusEl.textContent = status;
+  }
+  if (substatusEl && substatus !== null) {
+    substatusEl.textContent = substatus;
+  }
+}
+
+/**
+ * Add a tool to the progress list
+ */
+function addToolToProgressList(toolName, status, isThinking = false) {
+  const listEl = document.getElementById('streaming-tool-list');
+  if (!listEl) return;
+
+  const toolId = `streaming-tool-${toolName}-${Date.now()}`;
+  const icon = isThinking ? '🧠' : (status === 'running' ? '⏳' : status === 'success' ? '✓' : '✗');
+  const displayName = isThinking ? 'Thinking...' : formatToolName(toolName);
+
+  const toolEl = document.createElement('div');
+  toolEl.id = toolId;
+  toolEl.setAttribute('data-tool-name', toolName);
+  toolEl.style.cssText = 'padding: 4px 8px; border-left: 2px solid #dee2e6; margin-bottom: 4px;';
+  toolEl.innerHTML = `
+    <span class="tool-icon">${icon}</span>
+    <span class="tool-name">${escapeHTML(displayName)}</span>
+    <span class="tool-summary text-muted" style="margin-left: 8px;"></span>
+  `;
+
+  listEl.appendChild(toolEl);
+  scrollToBottom();
+}
+
+/**
+ * Update a tool in the progress list
+ */
+function updateToolInProgressList(toolName, status, summary = null) {
+  const listEl = document.getElementById('streaming-tool-list');
+  if (!listEl) return;
+
+  // Find the tool element (get the last one with this tool name)
+  const toolEls = listEl.querySelectorAll(`[data-tool-name="${toolName}"]`);
+  const toolEl = toolEls[toolEls.length - 1];
+  if (!toolEl) return;
+
+  const iconEl = toolEl.querySelector('.tool-icon');
+  const summaryEl = toolEl.querySelector('.tool-summary');
+
+  if (iconEl) {
+    iconEl.textContent = status === 'success' ? '✓' : '✗';
+    iconEl.style.color = status === 'success' ? '#28a745' : '#dc3545';
+  }
+  if (summaryEl && summary) {
+    summaryEl.textContent = summary;
+  }
+}
+
+/**
+ * Remove the streaming progress panel
+ */
+function removeStreamingProgressPanel() {
+  const panel = document.getElementById('streaming-progress-panel');
+  if (panel) {
+    panel.remove();
+  }
+}
+
+/**
+ * Clean up streaming state after completion or error
+ */
+function cleanupStreaming(message = null) {
+  // Close EventSource if still open
+  if (currentEventSource) {
+    currentEventSource.close();
+    currentEventSource = null;
+  }
+
+  // Remove progress panel
+  removeStreamingProgressPanel();
+
+  // If there was a message (error/stop), show it
+  if (message) {
+    // Remove the user message since request didn't complete
+    conversation.pop();
+    displayConversation(conversation);
+
+    const answerDiv = document.getElementById("answer");
+    const notice = document.createElement('div');
+    notice.className = 'alert alert-secondary';
+    notice.style.cssText = 'opacity: 0.8; font-size: 13px;';
+    notice.innerHTML = `<em>${escapeHTML(message)}</em>`;
+    answerDiv.appendChild(notice);
+
+    // Remove the notice after a few seconds
+    setTimeout(() => {
+      if (notice.parentNode) {
+        notice.remove();
+      }
+    }, 5000);
+  }
+
+  // Restore input state
+  restoreInputState();
+}
+
+/**
+ * Restore input and button to normal state
+ */
+function restoreInputState() {
+  const input = document.getElementById("question");
+  const askButton = document.getElementById("askButton");
+
+  if (input) {
+    input.disabled = false;
+    input.focus();
+  }
+
+  if (askButton) {
+    askButton.disabled = false;
+    askButton.innerHTML = 'Ask';
+    askButton.classList.remove('btn-danger');
+    askButton.classList.add('btn-primary');
+    askButton.onclick = null; // Clear stop handler
+  }
+
+  // Clear streaming state
+  currentEventSource = null;
+  streamingToolUsage = [];
+}
+
 
 function parseResponseMessage(response) {
   // If the response is null or undefined, return an error message

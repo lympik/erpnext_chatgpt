@@ -2,7 +2,9 @@ import frappe
 import logging
 from frappe import _
 import json
-from typing import List, Dict, Any
+import time
+from typing import List, Dict, Any, Generator
+from werkzeug.wrappers import Response
 from erpnext_chatgpt.erpnext_chatgpt.tools import (
     get_tools, get_claude_tools, available_functions, is_write_operation,
     get_write_tool_metadata, get_tool_by_name, json_serial
@@ -13,6 +15,27 @@ logger = frappe.logger("aiassistant", allow_site=True)
 logger.setLevel(logging.DEBUG)
 
 import re
+
+
+# =============================================================================
+# SSE (Server-Sent Events) Helper Functions
+# =============================================================================
+
+def sse_event(event_type: str, data: dict) -> str:
+    """
+    Format data as a Server-Sent Event.
+
+    :param event_type: The event name (e.g., 'tool_start', 'final_answer')
+    :param data: Dictionary of data to send
+    :return: SSE-formatted string
+    """
+    json_data = json.dumps(data, default=json_serial)
+    return f"event: {event_type}\ndata: {json_data}\n\n"
+
+
+def sse_heartbeat() -> str:
+    """Generate a heartbeat event to keep connection alive."""
+    return ": heartbeat\n\n"
 
 # Default system prompt for agentic tool-only workflow
 # Note: Tool definitions are passed separately via the tools parameter.
@@ -1113,6 +1136,350 @@ def run_claude_agentic_loop(client, model, system_prompt, conversation, tool_usa
     }
 
 
+def run_claude_agentic_loop_streaming(client, model, system_prompt, conversation, tool_usage_log, session_doc, max_tokens) -> Generator[str, None, None]:
+    """
+    Run the Claude agentic loop as a generator that yields SSE events.
+    This allows real-time streaming of progress to the client.
+    """
+    tools = get_claude_tools()
+    max_iterations = 15
+    iteration = 0
+    output_limit = get_model_output_limit(model)
+    last_heartbeat = time.time()
+    heartbeat_interval = 15  # seconds
+
+    # Yield connected event
+    yield sse_event("connected", {
+        "session_id": session_doc.name if session_doc else None,
+        "model": model,
+        "max_iterations": max_iterations
+    })
+
+    while iteration < max_iterations:
+        iteration += 1
+
+        # Yield iteration start event
+        yield sse_event("iteration_start", {
+            "iteration": iteration,
+            "max_iterations": max_iterations,
+            "tools_called_so_far": len(tool_usage_log)
+        })
+
+        try:
+            response = client.messages.create(
+                model=model,
+                max_tokens=output_limit,
+                system=system_prompt,
+                messages=conversation,
+                tools=tools,
+                tool_choice={"type": "any"}
+            )
+        except Exception as e:
+            logger.error(f"Claude API error: {str(e)}")
+            yield sse_event("error", {"error": str(e), "iteration": iteration})
+            return
+
+        logger.debug(f"Claude Response (iteration {iteration}): stop_reason={response.stop_reason}")
+
+        tool_blocks = [block for block in response.content if block.type == "tool_use"]
+        text_blocks = [block for block in response.content if block.type == "text"]
+
+        if not tool_blocks:
+            logger.warning("No tool calls returned despite tool_choice=any")
+            text_content = " ".join([b.text for b in text_blocks]) if text_blocks else "No response generated."
+            yield sse_event("final_answer", {
+                "role": "assistant",
+                "content": text_content,
+                "tool_usage": tool_usage_log,
+                "iterations": iteration,
+                "session_id": session_doc.name if session_doc else None
+            })
+            return
+
+        # Check for final_answer
+        for tool_block in tool_blocks:
+            if tool_block.name == "final_answer":
+                try:
+                    final_args = tool_block.input or {}
+                    logger.debug(f"Final answer received after {iteration} iterations")
+
+                    message = final_args.get("message", "")
+                    message = auto_link_document_ids(message)
+
+                    # Build context summary
+                    context_parts = []
+                    for tool_entry in tool_usage_log:
+                        tool_name = tool_entry.get("tool_name", "")
+                        params = tool_entry.get("parameters", {})
+                        if params and tool_name not in ["final_answer", "think"]:
+                            param_str = ", ".join(f"{k}={v}" for k, v in params.items() if v is not None)
+                            context_parts.append(f"{tool_name}({param_str})")
+
+                    if context_parts:
+                        context_note = "\n\n<!-- CONTEXT: " + " | ".join(context_parts) + " -->"
+                        message_with_context = message + context_note
+                    else:
+                        message_with_context = message
+
+                    # Add assistant response
+                    assistant_message = {
+                        "role": "assistant",
+                        "content": message_with_context,
+                        "content_display": message,
+                        "tool_usage": tool_usage_log
+                    }
+                    conversation.append(assistant_message)
+
+                    # Save conversation
+                    if session_doc:
+                        messages_to_save = extract_messages_for_storage(conversation)
+                        session_doc.messages = json.dumps(messages_to_save)
+                        session_doc.model_used = model
+                        session_doc.save(ignore_permissions=False)
+                        frappe.db.commit()
+
+                    yield sse_event("final_answer", {
+                        "role": "assistant",
+                        "content": message_with_context,
+                        "content_display": message,
+                        "tool_usage": tool_usage_log,
+                        "summary": final_args.get("summary"),
+                        "iterations": iteration,
+                        "session_id": session_doc.name if session_doc else None
+                    })
+                    return
+
+                except Exception as e:
+                    logger.error(f"Failed to parse final_answer: {e}")
+                    yield sse_event("error", {
+                        "error": str(e),
+                        "tool_usage": tool_usage_log,
+                        "session_id": session_doc.name if session_doc else None
+                    })
+                    return
+
+        # No final_answer yet - add assistant message with tool calls and handle them
+        assistant_content = []
+        for block in text_blocks:
+            assistant_content.append({"type": "text", "text": block.text})
+        for block in tool_blocks:
+            assistant_content.append({
+                "type": "tool_use",
+                "id": block.id,
+                "name": block.name,
+                "input": block.input
+            })
+
+        conversation.append({
+            "role": "assistant",
+            "content": assistant_content
+        })
+
+        # Handle tool calls with streaming events
+        # Collect all tool results to append as a single message (Claude API requirement)
+        tool_results = []
+
+        for tool_block in tool_blocks:
+            function_name = tool_block.name
+            tool_use_id = tool_block.id
+            function_args = tool_block.input or {}
+
+            # Yield tool_start event
+            yield sse_event("tool_start", {
+                "tool_name": function_name,
+                "parameters": function_args,
+                "iteration": iteration,
+                "is_thinking": function_name == "think"
+            })
+
+            # Check for heartbeat
+            if time.time() - last_heartbeat > heartbeat_interval:
+                yield sse_heartbeat()
+                last_heartbeat = time.time()
+
+            function_to_call = available_functions.get(function_name)
+            if not function_to_call:
+                error_msg = f"Function {function_name} not found."
+                logger.error(error_msg)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": f"Error: {error_msg}",
+                    "is_error": True
+                })
+                yield sse_event("tool_complete", {
+                    "tool_name": function_name,
+                    "status": "error",
+                    "error": error_msg
+                })
+                continue
+
+            # Check if this is a write operation that requires user confirmation
+            if is_write_operation(function_name):
+                write_metadata = get_write_tool_metadata(function_name)
+                logger.debug(f"Write operation detected: {function_name}, requiring confirmation")
+
+                pending_confirmation = {
+                    'tool_call_id': tool_use_id,
+                    'tool_name': function_name,
+                    'parameters': function_args,
+                    'confirmation_message': write_metadata.get('confirmation_message', f'Execute {function_name}'),
+                    'conversation_state': conversation.copy(),
+                    'tool_usage_log': tool_usage_log.copy(),
+                    'created_at': frappe.utils.now()
+                }
+
+                if session_doc:
+                    session_doc.pending_confirmation = json.dumps(pending_confirmation, default=json_serial)
+                    session_doc.save(ignore_permissions=False)
+                    frappe.db.commit()
+
+                yield sse_event("pending_confirmation", {
+                    "status": "pending_confirmation",
+                    "pending_confirmation": pending_confirmation,
+                    "tool_usage": tool_usage_log,
+                    "session_id": session_doc.name if session_doc else None
+                })
+                return
+
+            # Execute the tool
+            tool_usage_entry = {
+                "tool_name": function_name,
+                "parameters": function_args,
+                "timestamp": frappe.utils.now(),
+                "is_thinking": function_name == "think"
+            }
+
+            try:
+                function_response = function_to_call(**function_args)
+
+                # Parse response for summary
+                response_data = {}
+                try:
+                    response_data = json.loads(function_response)
+                    if isinstance(response_data, dict):
+                        if 'delivery_notes' in response_data:
+                            tool_usage_entry['result_summary'] = f"Retrieved {len(response_data['delivery_notes'])} delivery notes"
+                        elif 'invoices' in response_data:
+                            tool_usage_entry['result_summary'] = f"Retrieved {len(response_data['invoices'])} invoices"
+                        elif 'total_count' in response_data:
+                            tool_usage_entry['result_summary'] = f"Found {response_data.get('total_count', 0)} records"
+                        else:
+                            tool_usage_entry['result_summary'] = "Data retrieved successfully"
+                except:
+                    tool_usage_entry['result_summary'] = "Query executed"
+
+                tool_usage_entry['status'] = 'success'
+                tool_usage_entry['fetched_entities'] = extract_fetched_entities(function_name, response_data if isinstance(response_data, dict) else {})
+
+                # Collect tool result (will be added to conversation after loop)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": str(function_response)
+                })
+
+                # Check for recovery hints
+                needs_recovery, hint = analyze_tool_result(function_name, function_response)
+                if needs_recovery and hint:
+                    tool_usage_entry['recovery_hint'] = hint
+
+                yield sse_event("tool_complete", {
+                    "tool_name": function_name,
+                    "status": "success",
+                    "result_summary": tool_usage_entry.get('result_summary'),
+                    "is_thinking": function_name == "think"
+                })
+
+            except Exception as e:
+                error_msg = str(e)
+                logger.error(f"Error executing {function_name}: {error_msg}")
+                tool_usage_entry['status'] = 'error'
+                tool_usage_entry['error'] = error_msg
+
+                # Collect error result
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": f"Error: {error_msg}",
+                    "is_error": True
+                })
+
+                yield sse_event("tool_complete", {
+                    "tool_name": function_name,
+                    "status": "error",
+                    "error": error_msg
+                })
+
+            tool_usage_log.append(tool_usage_entry)
+
+        # Add all tool results to conversation as a single message
+        if tool_results:
+            conversation.append({
+                "role": "user",
+                "content": tool_results
+            })
+
+        # Check for recovery hints and inject context
+        for entry in tool_usage_log[-len(tool_blocks):]:
+            if entry.get('recovery_hint'):
+                conversation = inject_recovery_context(conversation, entry['recovery_hint'], "anthropic")
+                break
+
+        # Save checkpoint state after each iteration
+        if session_doc:
+            continuation_state = {
+                "conversation": conversation,
+                "tool_usage_log": tool_usage_log,
+                "iteration": iteration,
+                "created_at": frappe.utils.now()
+            }
+            session_doc.continuation_state = json.dumps(continuation_state, default=json_serial)
+            messages_to_save = extract_messages_for_storage(conversation)
+            session_doc.messages = json.dumps(messages_to_save)
+            session_doc.save(ignore_permissions=False)
+            frappe.db.commit()
+
+        logger.debug(f"Handled {len(tool_blocks)} tool calls, continuing to iteration {iteration + 1}")
+
+    # Max iterations reached
+    logger.warning(f"Hit max iterations ({max_iterations}) without final_answer")
+
+    tools_called = [t.get('tool_name') for t in tool_usage_log if t.get('tool_name') != 'think']
+    thinking_steps = len([t for t in tool_usage_log if t.get('is_thinking')])
+
+    progress_summary = {
+        "iterations_used": iteration,
+        "max_iterations": max_iterations,
+        "tools_called": tools_called,
+        "thinking_steps": thinking_steps,
+        "total_tool_calls": len(tool_usage_log)
+    }
+
+    # Save continuation state
+    if session_doc:
+        continuation_state = {
+            "conversation": conversation,
+            "tool_usage_log": tool_usage_log,
+            "iteration": iteration,
+            "created_at": frappe.utils.now()
+        }
+        session_doc.continuation_state = json.dumps(continuation_state, default=json_serial)
+        messages_to_save = extract_messages_for_storage(conversation)
+        session_doc.messages = json.dumps(messages_to_save)
+        session_doc.model_used = model
+        session_doc.save(ignore_permissions=False)
+        frappe.db.commit()
+
+    yield sse_event("limit_reached", {
+        "status": "limit_reached",
+        "progress_summary": progress_summary,
+        "tool_usage": tool_usage_log,
+        "message": f"I've made {len(tools_called)} tool calls across {iteration} iterations but haven't finished yet. Would you like me to continue?",
+        "session_id": session_doc.name if session_doc else None
+    })
+
+
 @frappe.whitelist()
 def ask_openai_question(session_id: str, message: str) -> Dict[str, Any]:
     """
@@ -1348,6 +1715,139 @@ def ask_openai_question(session_id: str, message: str) -> Dict[str, Any]:
     except Exception as e:
         frappe.log_error(message=str(e), title="OpenAI API Error")
         return {"error": str(e), "tool_usage": [], "session_id": session_id if session_id else None}
+
+
+@frappe.whitelist(methods=['GET'])
+def ask_openai_question_stream(session_id: str, message: str, csrf_token: str = None):
+    """
+    SSE endpoint that streams progress events during the agentic loop.
+    This prevents 504 Gateway Timeout errors by sending events throughout execution.
+
+    :param session_id: The conversation session ID
+    :param message: The user's new message
+    :param csrf_token: CSRF token for validation
+    :return: Streaming HTTP response with SSE events
+    """
+
+    def generate_events():
+        """Generator that yields SSE events."""
+        try:
+            if not session_id or not message:
+                yield sse_event("error", {"error": "session_id and message are required"})
+                return
+
+            # Check which provider to use
+            provider = get_api_provider()
+            tool_usage_log = []
+
+            # Load conversation from database
+            try:
+                session_doc = frappe.get_doc("AI Conversation", session_id)
+
+                # Check permission using owner field
+                if session_doc.owner != frappe.session.user and "System Manager" not in frappe.get_roles():
+                    yield sse_event("error", {"error": "You don't have permission to access this conversation"})
+                    return
+
+                # Load existing messages
+                conversation = json.loads(session_doc.messages) if session_doc.messages else []
+
+                # Add the new user message
+                conversation.append({"role": "user", "content": message})
+
+                # Auto-generate title from first user message if title is still default
+                if session_doc.title == "New Conversation" and message:
+                    session_doc.title = message[:50] + "..." if len(message) > 50 else message
+
+            except frappe.DoesNotExistError:
+                yield sse_event("error", {"error": "Conversation session not found"})
+                return
+
+            # Add system instructions as the initial message if not present
+            if not conversation or conversation[0].get("role") != "system":
+                conversation.insert(0, {"role": "system", "content": get_system_instructions()})
+
+            # Get model settings
+            model, max_tokens = get_model_settings()
+
+            # Trim conversation to stay within the token limit
+            conversation = trim_conversation_to_token_limit(conversation, max_tokens)
+
+            logger.info(f"[SSE ROUTING] Provider='{provider}', Model='{model}'")
+
+            # Route to appropriate provider
+            if provider == "anthropic":
+                # Use Claude with streaming
+                client = get_anthropic_client()
+
+                # Extract system prompt and convert messages to Claude format
+                system_prompt = None
+                claude_messages = []
+
+                for msg in conversation:
+                    if msg.get("role") == "system":
+                        system_prompt = msg.get("content", "")
+                    else:
+                        claude_messages.append(msg)
+
+                if not system_prompt:
+                    system_prompt = get_system_instructions()
+
+                # Use the streaming generator
+                yield from run_claude_agentic_loop_streaming(
+                    client, model, system_prompt, claude_messages,
+                    tool_usage_log, session_doc, max_tokens
+                )
+
+            else:
+                # OpenAI doesn't have streaming agentic loop yet
+                # Fall back to non-streaming and yield events manually
+                yield sse_event("connected", {
+                    "session_id": session_id,
+                    "model": model,
+                    "fallback": True
+                })
+
+                try:
+                    # Call the existing non-streaming function
+                    result = ask_openai_question(session_id, message)
+
+                    if result.get("status") == "pending_confirmation":
+                        yield sse_event("pending_confirmation", result)
+                    elif result.get("status") == "limit_reached":
+                        yield sse_event("limit_reached", result)
+                    elif result.get("error"):
+                        yield sse_event("error", {"error": result.get("error")})
+                    else:
+                        yield sse_event("final_answer", result)
+
+                except Exception as e:
+                    yield sse_event("error", {"error": str(e)})
+
+        except Exception as e:
+            logger.error(f"SSE stream error: {str(e)}")
+            frappe.log_error(message=str(e), title="SSE Stream Error")
+            yield sse_event("error", {"error": str(e)})
+
+    # Create the streaming response
+    response = Response(
+        generate_events(),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'X-Accel-Buffering': 'no',  # Disable nginx buffering
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': 'Content-Type, X-Frappe-CSRF-Token'
+        }
+    )
+
+    # Tell Frappe to use our raw response
+    frappe.local.response['type'] = 'raw'
+    frappe.local.response['response'] = response
+
+    return response
+
 
 @frappe.whitelist()
 def test_openai_api_key(api_key: str) -> bool:
