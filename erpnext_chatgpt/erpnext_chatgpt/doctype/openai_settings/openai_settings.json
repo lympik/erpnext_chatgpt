@@ -26,17 +26,16 @@
       "fieldname": "model",
       "fieldtype": "Select",
       "label": "Model",
-      "options": "claude-sonnet-4-20250514\nclaude-opus-4-5-20250514\nclaude-3-5-sonnet-20241022\nclaude-3-5-haiku-20241022\ngpt-4.1\ngpt-4o\ngpt-4o-mini\no4-mini\no3\no3-mini\no3-pro\ngpt-4-turbo\ngpt-3.5-turbo",
-      "default": "claude-sonnet-4-20250514",
+      "options": "claude-sonnet-4-20250514 (Recommended - Fast & Capable)\nclaude-opus-4-5-20250514 (Most Intelligent)\nclaude-sonnet-4-5-20250514 (Latest Sonnet)\nclaude-3-5-sonnet-20241022 (Previous Sonnet)\nclaude-3-5-haiku-20241022 (Fastest & Cheapest)\ngpt-4.1 (Latest GPT-4)\ngpt-4o (Fast GPT-4)\ngpt-4o-mini (Budget GPT-4)\ngpt-4-turbo (GPT-4 Turbo)\no3-mini (Reasoning - Fast)\no4-mini (Reasoning - Latest)",
+      "default": "claude-sonnet-4-20250514 (Recommended - Fast & Capable)",
       "reqd": 1,
-      "description": "Select the model. Claude Sonnet 4 is recommended for best balance of speed and capability. For Anthropic, use claude-* models. For OpenAI, use gpt-* or o-* models."
+      "description": "Select the model. Max tokens will be set automatically based on model capabilities."
     },
     {
       "fieldname": "max_tokens",
       "fieldtype": "Int",
-      "label": "Max Tokens",
-      "default": 8000,
-      "description": "Maximum number of tokens for conversation context (default: 8000)"
+      "label": "Max Tokens (Context)",
+      "description": "Maximum tokens for conversation context. Leave empty for automatic defaults based on model. Claude models: 150K, GPT-4: 100K, GPT-4-mini: 80K"
     },
     {
       "fieldname": "section_break_1",

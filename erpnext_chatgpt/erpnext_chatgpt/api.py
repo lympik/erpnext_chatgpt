@@ -240,21 +240,71 @@ def get_system_instructions():
     return system_instructions
 
 def get_model_settings():
-    """Get model and max_tokens from settings."""
-    model = frappe.db.get_single_value("OpenAI Settings", "model")
+    """Get model and max_tokens from settings with smart defaults."""
+    model_raw = frappe.db.get_single_value("OpenAI Settings", "model")
     max_tokens = frappe.db.get_single_value("OpenAI Settings", "max_tokens")
 
-    # Use defaults if not set
-    if not model:
-        model = "gpt-4o-mini"
-    if not max_tokens:
-        max_tokens = 8000
+    # Parse model name (strip description in parentheses)
+    # e.g., "claude-sonnet-4-20250514 (Recommended - Fast & Capable)" -> "claude-sonnet-4-20250514"
+    if model_raw:
+        model = model_raw.split(" (")[0].strip()
+    else:
+        model = "claude-sonnet-4-20250514"
 
-    return model, max_tokens
+    # Smart defaults for max_tokens based on model context windows
+    # These are conservative limits for conversation context management
+    model_token_defaults = {
+        # Claude models (200K context window - use 150K for safety)
+        "claude-opus-4-5-20250514": 150000,
+        "claude-sonnet-4-20250514": 150000,
+        "claude-sonnet-4-5-20250514": 150000,
+        "claude-3-5-sonnet-20241022": 150000,
+        "claude-3-5-haiku-20241022": 150000,
+        # GPT-4 models (128K context window - use 100K for safety)
+        "gpt-4.1": 100000,
+        "gpt-4o": 100000,
+        "gpt-4-turbo": 100000,
+        # GPT-4 mini (128K but use less for cost efficiency)
+        "gpt-4o-mini": 80000,
+        # Reasoning models (vary, use conservative defaults)
+        "o3-mini": 80000,
+        "o4-mini": 80000,
+    }
+
+    if not max_tokens:
+        max_tokens = model_token_defaults.get(model, 100000)
+
+    return model, int(max_tokens)
+
+
+def get_model_output_limit(model: str) -> int:
+    """Get the maximum output tokens for a model."""
+    output_limits = {
+        # Claude Sonnet 4 models support up to 64K output
+        "claude-sonnet-4-20250514": 16000,
+        "claude-sonnet-4-5-20250514": 16000,
+        # Claude Opus supports up to 32K output
+        "claude-opus-4-5-20250514": 16000,
+        # Older Claude models
+        "claude-3-5-sonnet-20241022": 8192,
+        "claude-3-5-haiku-20241022": 8192,
+        # GPT-4 models
+        "gpt-4.1": 16384,
+        "gpt-4o": 16384,
+        "gpt-4-turbo": 4096,
+        "gpt-4o-mini": 16384,
+        # Reasoning models
+        "o3-mini": 16384,
+        "o4-mini": 16384,
+    }
+    # Default to 8192 for unknown models
+    return output_limits.get(model, 8192)
 
 def get_openai_client():
     """Get the OpenAI client with the API key from settings."""
-    api_key = frappe.db.get_single_value("OpenAI Settings", "api_key")
+    # Use get_password() for Password fieldtype to decrypt the value
+    settings = frappe.get_single("OpenAI Settings")
+    api_key = settings.get_password("api_key")
     if not api_key:
         frappe.throw(_("OpenAI API key is not set in OpenAI Settings."))
 
@@ -268,7 +318,9 @@ def get_openai_client():
 
 def get_anthropic_client():
     """Get the Anthropic client with the API key from settings."""
-    api_key = frappe.db.get_single_value("OpenAI Settings", "api_key")
+    # Use get_password() for Password fieldtype to decrypt the value
+    settings = frappe.get_single("OpenAI Settings")
+    api_key = settings.get_password("api_key")
     if not api_key:
         frappe.throw(_("Anthropic API key is not set in OpenAI Settings."))
 
@@ -872,6 +924,7 @@ def run_claude_agentic_loop(client, model, system_prompt, conversation, tool_usa
     tools = get_claude_tools()
     max_iterations = 15
     iteration = 0
+    output_limit = get_model_output_limit(model)
 
     while iteration < max_iterations:
         iteration += 1
@@ -879,7 +932,7 @@ def run_claude_agentic_loop(client, model, system_prompt, conversation, tool_usa
         try:
             response = client.messages.create(
                 model=model,
-                max_tokens=4096,
+                max_tokens=output_limit,
                 system=system_prompt,
                 messages=conversation,
                 tools=tools,
@@ -1338,10 +1391,11 @@ def test_connection() -> Dict[str, Any]:
     :return: Dictionary with success status and message.
     """
     try:
-        # Get the API key from settings
-        api_key = frappe.db.get_single_value("OpenAI Settings", "api_key")
+        # Get the API key from settings using get_password for Password fieldtype
+        settings = frappe.get_single("OpenAI Settings")
+        api_key = settings.get_password("api_key")
         if not api_key:
-            return {"success": False, "message": _("OpenAI API key is not set. Please enter an API key first.")}
+            return {"success": False, "message": _("API key is not set. Please enter an API key first.")}
 
         # Import OpenAI
         from openai import OpenAI
