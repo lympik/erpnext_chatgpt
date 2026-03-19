@@ -1107,7 +1107,7 @@ function convertERPNextReferencesToLinks(content) {
 function renderMessageContent(content) {
   console.log("Rendering content:", content);
 
-  if (content === null) return "<em>null</em>";
+  if (content === null || content === undefined) return "";
   if (typeof content === "boolean") return `<strong>${content}</strong>`;
   if (typeof content === "number") return `<span>${content}</span>`;
   if (typeof content === "string") {
@@ -1118,20 +1118,39 @@ function renderMessageContent(content) {
     // Finally, convert any remaining plain text ERPNext references to links
     // (but this won't affect already-rendered HTML links)
     const finalContent = convertERPNextReferencesToLinks(sanitized);
-    console.log(finalContent);
     return finalContent;
   }
-  if (Array.isArray(content)) {
-    return `<ul class="list-group">${content
-      .map(
-        (item) =>
-          `<li class="list-group-item">${renderMessageContent(item)}</li>`
-      )
-      .join("")}</ul>`;
-  }
-  if (typeof content === "object") return renderCollapsibleObject(content);
 
-  return `<em>Unsupported type: ${typeof content}</em>`;
+  // Handle Claude content block format: [{type: "text", text: "..."}]
+  if (Array.isArray(content)) {
+    // Extract text from content blocks
+    const textParts = content
+      .filter(block => block && (block.type === "text" || block.text))
+      .map(block => block.text || "")
+      .filter(text => text);
+
+    if (textParts.length > 0) {
+      return renderMessageContent(textParts.join("\n"));
+    }
+
+    // If no text blocks found, skip rendering
+    return "";
+  }
+
+  // Handle single content block object: {type: "text", text: "..."}
+  if (typeof content === "object") {
+    if (content.type === "text" && content.text) {
+      return renderMessageContent(content.text);
+    }
+    // Skip tool_use blocks and other non-text objects
+    if (content.type === "tool_use" || content.type === "tool_result") {
+      return "";
+    }
+    // For other objects, don't show "Toggle Object" - just skip
+    return "";
+  }
+
+  return "";
 }
 
 function renderCollapsibleObject(object) {

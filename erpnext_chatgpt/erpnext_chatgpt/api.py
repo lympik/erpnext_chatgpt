@@ -1410,7 +1410,7 @@ def test_connection() -> Dict[str, Any]:
             return {"success": False, "message": _("API key is not set. Please enter an API key first.")}
 
         provider = get_api_provider()
-        model, _ = get_model_settings()
+        model, _max_tokens = get_model_settings()
 
         if provider == "anthropic":
             # Test Anthropic/Claude connection
@@ -1478,7 +1478,7 @@ def create_conversation(title: str = None) -> Dict[str, Any]:
     :return: Dictionary with session_id and conversation details
     """
     try:
-        model, _ = get_model_settings()
+        model, _max_tokens = get_model_settings()
 
         doc = frappe.get_doc({
             "doctype": "AI Conversation",
