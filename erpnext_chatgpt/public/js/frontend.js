@@ -107,8 +107,14 @@ async function loadSession(sessionId) {
         displayConversation(conversation);
       }
 
-      // Check for pending confirmation
-      await checkPendingConfirmation(sessionId);
+      // Check for pending confirmation first
+      const hasPendingConfirmation = await checkPendingConfirmation(sessionId);
+
+      // Only check for pending continuation if there's no pending confirmation
+      // A session shouldn't have both states simultaneously
+      if (!hasPendingConfirmation) {
+        checkPendingContinuation(response.message.continuation_state);
+      }
     } else {
       console.error("Failed to load session:", response?.message?.error);
       // Session not found, create new one
@@ -131,10 +137,38 @@ async function checkPendingConfirmation(sessionId) {
     if (response?.message?.pending_confirmation) {
       pendingConfirmation = response.message.pending_confirmation;
       renderWriteConfirmation(pendingConfirmation);
+      return true; // Indicate that a pending confirmation was found
     }
   } catch (error) {
     console.error("Error checking pending confirmation:", error);
   }
+  return false; // No pending confirmation
+}
+
+function checkPendingContinuation(continuationState) {
+  // Check if the session has a saved continuation state (limit reached)
+  // This is called after loading a session to restore the limit reached UI
+  // The continuationState is passed directly from the loadSession response
+  if (!continuationState) {
+    return;
+  }
+
+  console.log("Found pending continuation state:", continuationState);
+
+  // Reconstruct the limit reached data for the UI
+  // Filter out 'think' entries to match the backend's initial response behavior
+  const limitData = {
+    status: "limit_reached",
+    message: "The AI was interrupted at the iteration limit. You can continue or stop here.",
+    progress_summary: {
+      iterations_used: continuationState.iteration || 0,
+      max_iterations: 15,
+      tools_called: continuationState.tool_usage_log?.filter(t => t.tool_name !== 'think').map(t => t.tool_name) || [],
+      thinking_steps: continuationState.tool_usage_log?.filter(t => t.is_thinking).length || 0
+    }
+  };
+
+  renderLimitReachedUI(limitData);
 }
 
 async function createNewConversation() {
@@ -192,6 +226,9 @@ function createChatDialog() {
             <h5 class="modal-title mb-0" id="chatDialogTitle">AI Assistant</h5>
           </div>
           <div>
+            <button type="button" class="btn btn-sm btn-outline-secondary mr-1" onclick="window.downloadDebugLog()" title="Download debug log">
+              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+            </button>
             <button type="button" class="btn btn-sm btn-outline-primary mr-2" onclick="window.startNewConversation()" title="New conversation">
               <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
               New
@@ -513,6 +550,21 @@ async function askQuestion(question) {
       return; // Don't process as a normal response
     }
 
+    // Check if this is a limit reached response
+    if (data.message?.status === "limit_reached") {
+      console.log("Iteration limit reached:", data.message.progress_summary);
+
+      // Update session ID if returned
+      if (data.message?.session_id) {
+        currentSessionId = data.message.session_id;
+        localStorage.setItem("lastAISessionId", currentSessionId);
+      }
+
+      // Display the limit reached UI
+      renderLimitReachedUI(data.message);
+      return; // Don't process as a normal response
+    }
+
     const parsedMessage = parseResponseMessage(data);
     console.log("Parsed message with tool usage:", parsedMessage.tool_usage);
 
@@ -666,9 +718,13 @@ function scrollToBottom() {
 function renderToolUsageToggle(toolUsage, messageId) {
   if (!toolUsage || toolUsage.length === 0) return "";
 
-  // Collect all fetched entities from all tool calls
+  // Separate thinking from regular tools
+  const thinkingEntries = toolUsage.filter(t => t.is_thinking);
+  const regularTools = toolUsage.filter(t => !t.is_thinking);
+
+  // Collect all fetched entities from non-thinking tool calls
   const allEntities = [];
-  toolUsage.forEach(tool => {
+  regularTools.forEach(tool => {
     console.log("Tool usage entry:", tool.tool_name, "fetched_entities:", tool.fetched_entities);
     if (tool.fetched_entities && tool.fetched_entities.length > 0) {
       tool.fetched_entities.forEach(entity => {
@@ -681,21 +737,43 @@ function renderToolUsageToggle(toolUsage, messageId) {
   });
   console.log("All entities for chips:", allEntities);
 
-  return `
-    <div class="mt-2">
+  let html = `<div class="mt-2">`;
+
+  // Regular tools section
+  if (regularTools.length > 0) {
+    html += `
       <button
         class="btn btn-sm btn-outline-secondary"
         onclick="toggleToolUsage('${messageId}')"
         style="font-size: 12px; padding: 4px 10px; border-radius: 4px;"
       >
-        ℹ️ <span id="${messageId}-toggle-text">Show</span> data access info (${toolUsage.length} ${toolUsage.length === 1 ? 'query' : 'queries'})
+        ℹ️ <span id="${messageId}-toggle-text">Show</span> data access info (${regularTools.length} ${regularTools.length === 1 ? 'query' : 'queries'})
       </button>
       ${renderEntityChips(allEntities, messageId)}
       <div id="${messageId}-details" style="display: none;" class="mt-2">
-        ${renderToolUsageDetails(toolUsage)}
+        ${renderToolUsageDetails(regularTools)}
       </div>
-    </div>
-  `;
+    `;
+  }
+
+  // Thinking section (collapsible)
+  if (thinkingEntries.length > 0) {
+    html += `
+      <button
+        class="btn btn-sm btn-outline-info ml-2"
+        onclick="toggleThinking('${messageId}')"
+        style="font-size: 12px; padding: 4px 10px; border-radius: 4px;"
+      >
+        🧠 <span id="${messageId}-thinking-toggle-text">Show</span> AI reasoning (${thinkingEntries.length})
+      </button>
+      <div id="${messageId}-thinking-details" style="display: none;" class="mt-2">
+        ${renderThinkingDetails(thinkingEntries)}
+      </div>
+    `;
+  }
+
+  html += `</div>`;
+  return html;
 }
 
 function renderEntityChips(entities, messageId) {
@@ -785,6 +863,60 @@ window.toggleToolUsage = function(messageId) {
   }
 }
 
+// Make toggleThinking globally available for onclick events
+window.toggleThinking = function(messageId) {
+  const details = document.getElementById(`${messageId}-thinking-details`);
+  const toggleText = document.getElementById(`${messageId}-thinking-toggle-text`);
+
+  if (details && toggleText) {
+    if (details.style.display === "none") {
+      details.style.display = "block";
+      toggleText.textContent = "Hide";
+    } else {
+      details.style.display = "none";
+      toggleText.textContent = "Show";
+    }
+  }
+}
+
+function renderThinkingDetails(thinkingEntries) {
+  if (!thinkingEntries || thinkingEntries.length === 0) return "";
+
+  let html = `
+    <div class="card" style="background-color: #e7f3ff; border: 1px solid #b6d4fe;">
+      <div class="card-body" style="padding: 10px;">
+        <h6 class="card-title" style="font-size: 14px; margin-bottom: 10px; color: #084298;">
+          🧠 AI Reasoning Process
+        </h6>
+        <div style="font-size: 12px;">
+  `;
+
+  thinkingEntries.forEach((entry, index) => {
+    const params = entry.parameters || {};
+    const reasoning = params.reasoning || 'No reasoning provided';
+    const plan = params.plan;
+    const observations = params.observations;
+
+    html += `
+      <div class="mb-2" style="padding: 8px; background: white; border-radius: 4px; border-left: 3px solid #0d6efd;">
+        <div style="color: #333; margin-bottom: 4px;">
+          <strong>Step ${index + 1}:</strong> ${escapeHTML(reasoning)}
+        </div>
+        ${plan ? `<div style="color: #666; font-size: 11px;"><strong>Plan:</strong> ${escapeHTML(plan)}</div>` : ''}
+        ${observations ? `<div style="color: #666; font-size: 11px;"><strong>Observations:</strong> ${escapeHTML(observations)}</div>` : ''}
+      </div>
+    `;
+  });
+
+  html += `
+        </div>
+      </div>
+    </div>
+  `;
+
+  return html;
+}
+
 function renderToolUsageDetails(toolUsage) {
   let toolHtml = `
     <div class="card" style="background-color: #f8f9fa; border: 1px solid #dee2e6;">
@@ -801,11 +933,11 @@ function renderToolUsageDetails(toolUsage) {
 
     toolHtml += `
       <div class="mb-2" style="padding-left: 10px; border-left: 2px solid #dee2e6;">
-        <strong>${index + 1}. ${formatToolName(tool.tool_name)}</strong>
+        <strong>${index + 1}. ${escapeHTML(formatToolName(tool.tool_name))}</strong>
         <span class="${statusClass}">${statusIcon}</span>
-        ${tool.result_summary ? `<br><span class="text-muted">${tool.result_summary}</span>` : ''}
+        ${tool.result_summary ? `<br><span class="text-muted">${escapeHTML(String(tool.result_summary))}</span>` : ''}
         ${renderToolParameters(tool.parameters)}
-        ${tool.error ? `<br><span class="text-danger">Error: ${tool.error}</span>` : ''}
+        ${tool.error ? `<br><span class="text-danger">Error: ${escapeHTML(String(tool.error))}</span>` : ''}
       </div>
     `;
   });
@@ -834,7 +966,7 @@ function renderToolParameters(params) {
 
   for (const [key, value] of Object.entries(params)) {
     if (value !== null && value !== undefined && value !== "") {
-      paramStrings.push(`${key}: ${JSON.stringify(value)}`);
+      paramStrings.push(`${escapeHTML(key)}: ${escapeHTML(JSON.stringify(value))}`);
     }
   }
 
@@ -920,7 +1052,7 @@ function convertERPNextReferencesToLinks(content) {
     });
 
     // Return a styled link element
-    return `<a href="#" id="${linkId}" class="erpnext-doc-link" style="color: #007bff; text-decoration: underline; cursor: pointer;" title="Open ${normalizedDocType}: ${docName.trim()}">${match}</a>`;
+    return `<a href="#" id="${linkId}" class="erpnext-doc-link" style="color: #007bff; text-decoration: underline; cursor: pointer;" title="Open ${escapeHTML(normalizedDocType)}: ${escapeHTML(docName.trim())}">${escapeHTML(match)}</a>`;
   });
 
   // Also replace standalone Service Protocol references (but not if they're placeholders)
@@ -941,7 +1073,7 @@ function convertERPNextReferencesToLinks(content) {
     });
 
     // Return a styled link element
-    return `<a href="#" id="${linkId}" class="erpnext-doc-link" style="color: #007bff; text-decoration: underline; cursor: pointer;" title="Open Service Protocol: ${protocolName.trim()}">${match}</a>`;
+    return `<a href="#" id="${linkId}" class="erpnext-doc-link" style="color: #007bff; text-decoration: underline; cursor: pointer;" title="Open Service Protocol: ${escapeHTML(protocolName.trim())}">${escapeHTML(match)}</a>`;
   });
 
   // Restore the original anchor tags
@@ -1545,3 +1677,313 @@ window.handleConfirmAction = handleConfirmAction;
 window.showChangeInput = showChangeInput;
 window.hideChangeInput = hideChangeInput;
 window.submitChangeRequest = submitChangeRequest;
+
+// =============================================================================
+// Iteration Limit Reached UI
+// =============================================================================
+
+function renderLimitReachedUI(limitData) {
+  console.log("renderLimitReachedUI called with:", limitData);
+
+  const answerDiv = document.getElementById("answer");
+  if (!answerDiv) {
+    console.error("answer div not found");
+    return;
+  }
+
+  const progress = limitData.progress_summary || {};
+  const toolsCalled = progress.tools_called || [];
+  const iterations = progress.iterations_used || 0;
+  const maxIterations = progress.max_iterations || 15;
+  const thinkingSteps = progress.thinking_steps || 0;
+
+  // Build a summary of tools used
+  const toolSummary = {};
+  toolsCalled.forEach(tool => {
+    toolSummary[tool] = (toolSummary[tool] || 0) + 1;
+  });
+
+  let toolListHtml = '';
+  for (const [tool, count] of Object.entries(toolSummary)) {
+    toolListHtml += `<div style="display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid #eee;">
+      <span>${escapeHTML(formatToolName(tool))}</span>
+      <span class="badge badge-secondary">${count}x</span>
+    </div>`;
+  }
+
+  // Create the limit reached panel
+  const limitPanel = document.createElement('div');
+  limitPanel.id = 'limit-reached-panel';
+  limitPanel.className = 'alert alert-info';
+  limitPanel.style.cssText = 'border-left: 4px solid #17a2b8;';
+  limitPanel.innerHTML = `
+    <div style="display: flex; align-items: center; margin-bottom: 12px;">
+      <span style="font-size: 24px; margin-right: 10px;">⏱️</span>
+      <h5 style="margin: 0; font-weight: 600;">Processing Limit Reached</h5>
+    </div>
+    <p style="color: #0c5460; margin-bottom: 15px;">
+      ${escapeHTML(limitData.message || 'The AI has used all available iterations but hasn\'t finished yet.')}
+    </p>
+    <div style="background: #d1ecf1; border: 1px solid #bee5eb; border-radius: 6px; padding: 12px; margin-bottom: 15px;">
+      <div style="display: flex; justify-content: space-between; margin-bottom: 10px;">
+        <strong>Progress:</strong>
+        <span>${iterations} / ${maxIterations} iterations</span>
+      </div>
+      <div style="background: #fff; border-radius: 4px; height: 8px; overflow: hidden; margin-bottom: 10px;">
+        <div style="background: #17a2b8; height: 100%; width: ${Math.min(100, (iterations / maxIterations) * 100)}%;"></div>
+      </div>
+      ${thinkingSteps > 0 ? `<div style="font-size: 12px; color: #0c5460; margin-bottom: 8px;">🧠 ${thinkingSteps} reasoning steps</div>` : ''}
+      <div style="font-size: 13px; max-height: 150px; overflow-y: auto;">
+        <strong style="display: block; margin-bottom: 6px;">Tools used (${toolsCalled.length} calls):</strong>
+        ${toolListHtml || '<em>No tools called yet</em>'}
+      </div>
+    </div>
+    <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+      <button id="limitContinueBtn" class="btn btn-primary">
+        ▶️ Continue Processing
+      </button>
+      <button id="limitStopBtn" class="btn btn-secondary">
+        ⏹️ Stop Here
+      </button>
+    </div>
+  `;
+
+  // Append the panel to the answer div
+  answerDiv.appendChild(limitPanel);
+  console.log("Limit reached panel appended");
+
+  // Scroll to the panel
+  scrollToBottom();
+
+  // Attach event handlers
+  setTimeout(() => {
+    const continueBtn = document.getElementById('limitContinueBtn');
+    const stopBtn = document.getElementById('limitStopBtn');
+
+    if (continueBtn) continueBtn.addEventListener('click', () => handleLimitAction('continue'));
+    if (stopBtn) stopBtn.addEventListener('click', () => handleLimitAction('stop'));
+    console.log("Limit action handlers attached");
+  }, 0);
+}
+
+async function handleLimitAction(action) {
+  const continueBtn = document.getElementById('limitContinueBtn');
+  const stopBtn = document.getElementById('limitStopBtn');
+
+  // Disable buttons
+  if (continueBtn) continueBtn.disabled = true;
+  if (stopBtn) stopBtn.disabled = true;
+
+  // Show loading state
+  const activeBtn = action === 'continue' ? continueBtn : stopBtn;
+  if (activeBtn) {
+    const originalText = activeBtn.innerHTML;
+    activeBtn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status"></span> Processing...';
+  }
+
+  // Remove the limit panel
+  removeLimitReachedPanel();
+
+  // Show a processing message
+  const processingMessage = document.createElement('div');
+  processingMessage.id = 'limit-processing';
+  processingMessage.className = 'alert alert-light';
+  processingMessage.innerHTML = `
+    <div style="display: flex; align-items: center; gap: 10px;">
+      <span class="spinner-border spinner-border-sm" role="status"></span>
+      <span>${action === 'continue' ? 'Continuing processing...' : 'Stopping and saving progress...'}</span>
+    </div>
+  `;
+  document.getElementById('answer').appendChild(processingMessage);
+  scrollToBottom();
+
+  try {
+    const response = await fetch(
+      "/api/method/erpnext_chatgpt.erpnext_chatgpt.api.continue_from_limit",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Frappe-CSRF-Token": frappe.csrf_token,
+        },
+        body: JSON.stringify({
+          session_id: currentSessionId,
+          action: action
+        }),
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    const data = await response.json();
+    console.log("Continue from limit response:", data);
+
+    // Remove processing message
+    const processingEl = document.getElementById('limit-processing');
+    if (processingEl) processingEl.remove();
+
+    // Check if we hit the limit again
+    if (data.message?.status === "limit_reached") {
+      console.log("Limit reached again:", data.message.progress_summary);
+      renderLimitReachedUI(data.message);
+      return;
+    }
+
+    // Check if there's a pending confirmation
+    if (data.message?.status === "pending_confirmation") {
+      pendingConfirmation = data.message.pending_confirmation;
+      renderWriteConfirmation(pendingConfirmation);
+      return;
+    }
+
+    // Parse and display the response
+    const parsedMessage = parseResponseMessage(data);
+    conversation.push({
+      role: "assistant",
+      content: parsedMessage.content,
+      content_display: parsedMessage.content_display,
+      tool_usage: parsedMessage.tool_usage
+    });
+
+    // Update session ID if returned
+    if (data.message?.session_id) {
+      currentSessionId = data.message.session_id;
+      localStorage.setItem("lastAISessionId", currentSessionId);
+    }
+
+    displayConversation(conversation);
+
+  } catch (error) {
+    console.error('Error handling limit action:', error);
+
+    // Remove processing message
+    const processingEl = document.getElementById('limit-processing');
+    if (processingEl) processingEl.remove();
+
+    frappe.msgprint({
+      title: 'Error',
+      indicator: 'red',
+      message: `Failed to ${action === 'continue' ? 'continue' : 'stop'}: ${error.message}`
+    });
+  }
+}
+
+function removeLimitReachedPanel() {
+  const panel = document.getElementById('limit-reached-panel');
+  if (panel) {
+    panel.remove();
+  }
+}
+
+// Make limit action functions globally available
+window.handleLimitAction = handleLimitAction;
+
+
+// =============================================================================
+// Debug Log Download
+// =============================================================================
+
+window.downloadDebugLog = async function() {
+  try {
+    // Collect all debug information
+    const debugData = {
+      meta: {
+        exported_at: new Date().toISOString(),
+        session_id: currentSessionId,
+        user: frappe.session.user,
+        user_agent: navigator.userAgent,
+        url: window.location.href,
+        frappe_version: frappe.boot?.versions?.frappe || 'unknown',
+        erpnext_version: frappe.boot?.versions?.erpnext || 'unknown'
+      },
+      conversation: {
+        local_cache: conversation,
+        message_count: conversation.length,
+        user_messages: conversation.filter(m => m.role === 'user').length,
+        assistant_messages: conversation.filter(m => m.role === 'assistant').length
+      },
+      tool_usage: extractAllToolUsage(),
+      pending_confirmation: pendingConfirmation,
+      local_storage: {
+        lastAISessionId: localStorage.getItem('lastAISessionId')
+      }
+    };
+
+    // Try to fetch server-side session data
+    if (currentSessionId) {
+      try {
+        const serverData = await fetchServerDebugData(currentSessionId);
+        debugData.server_session = serverData;
+      } catch (err) {
+        debugData.server_session = { error: err.message };
+      }
+    }
+
+    // Generate filename with timestamp
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const filename = `ai-chat-debug-${currentSessionId || 'no-session'}-${timestamp}.json`;
+
+    // Create and download the file
+    const blob = new Blob([JSON.stringify(debugData, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+    frappe.show_alert({
+      message: `Debug log downloaded: ${filename}`,
+      indicator: 'green'
+    }, 3);
+
+  } catch (error) {
+    console.error('Error downloading debug log:', error);
+    frappe.msgprint({
+      title: 'Download Error',
+      indicator: 'red',
+      message: `Failed to download debug log: ${error.message}`
+    });
+  }
+};
+
+function extractAllToolUsage() {
+  // Extract all tool usage from conversation
+  const allToolUsage = [];
+  conversation.forEach((msg, index) => {
+    if (msg.tool_usage && msg.tool_usage.length > 0) {
+      allToolUsage.push({
+        message_index: index,
+        role: msg.role,
+        tools: msg.tool_usage.map(tool => ({
+          tool_name: tool.tool_name,
+          parameters: tool.parameters,
+          status: tool.status,
+          result_summary: tool.result_summary,
+          is_thinking: tool.is_thinking,
+          error: tool.error,
+          recovery_hint: tool.recovery_hint,
+          timestamp: tool.timestamp
+        }))
+      });
+    }
+  });
+  return allToolUsage;
+}
+
+async function fetchServerDebugData(sessionId) {
+  const response = await frappe.call({
+    method: 'erpnext_chatgpt.erpnext_chatgpt.api.get_debug_data',
+    args: { session_id: sessionId }
+  });
+
+  if (response?.message?.success) {
+    return response.message;
+  } else {
+    throw new Error(response?.message?.error || 'Failed to fetch server data');
+  }
+}

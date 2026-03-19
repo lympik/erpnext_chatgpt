@@ -61,6 +61,13 @@
       "label": "Pending Confirmation",
       "hidden": 1,
       "description": "Stores pending write operation awaiting user confirmation"
+    },
+    {
+      "fieldname": "continuation_state",
+      "fieldtype": "JSON",
+      "label": "Continuation State",
+      "hidden": 1,
+      "description": "Stores conversation state when iteration limit is reached for potential continuation"
     }
   ],
   "permissions": [

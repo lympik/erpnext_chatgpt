@@ -93,13 +93,17 @@ bench migrate
 
 ## Architecture
 
-This is an ERPNext app that integrates OpenAI capabilities into the ERPNext ERP system. Key architectural components:
+This is an ERPNext app that integrates AI capabilities (Claude/Anthropic and OpenAI) into the ERPNext ERP system. Key architectural components:
 
 ### Core Structure
 - **Frappe Framework Integration**: Built on top of Frappe/ERPNext framework, using its ORM, API patterns, and whitelisting mechanisms
-- **OpenAI Client**: Uses OpenAI Python SDK v1.32.0 for GPT-4 model interactions
-- **Tool System**: Implements function calling with 14+ ERPNext-specific tools for data retrieval (sales invoices, employees, stock levels, etc.)
+- **Multi-Provider Support**: Supports both Anthropic (Claude) and OpenAI APIs
+  - **Anthropic/Claude**: Recommended for better agentic capabilities (claude-sonnet-4, claude-opus-4.5)
+  - **OpenAI**: Legacy support for GPT-4 and o-series models
+- **Tool System**: Implements function calling with 25+ ERPNext-specific tools for data retrieval and creation
+- **Think Tool**: Explicit reasoning tool for complex multi-step queries
 - **Entity Resolution**: The `lookup_entity` tool resolves informal entity names to exact database identifiers before querying documents
+- **Recovery Logic**: Automatic suggestion injection for empty results and error recovery
 
 ### Entity Resolution Pattern
 
@@ -130,21 +134,29 @@ print(f"All matches: {data.get('matches')}")
 ```
 
 ### Key Files
-- `erpnext_chatgpt/api.py`: Main API endpoints for OpenAI integration
+- `erpnext_chatgpt/api.py`: Main API endpoints for AI integration
   - Handles conversation management with configurable token limiting
-  - Model selection from settings (gpt-3.5-turbo, gpt-4, etc.)
-  - Implements tool calling system for ERPNext data queries
-  - Manages OpenAI client initialization and API key validation
+  - Multi-provider support (Anthropic Claude and OpenAI)
+  - Implements agentic tool calling loop with recovery logic
+  - `run_claude_agentic_loop()`: Claude-specific loop with tool_choice=any
+  - `analyze_tool_result()`: Detects empty results and suggests recovery actions
+  - `inject_recovery_context()`: Adds hints to guide the AI on next steps
 
 - `erpnext_chatgpt/tools.py`: Defines available ERPNext functions
   - Each function queries ERPNext database directly via SQL
   - Includes JSON serialization for ERPNext data types
-  - Functions mapped to OpenAI tool definitions
+  - `get_tools()`: Returns OpenAI-format tool definitions
+  - `get_claude_tools()`: Returns Claude-format tool definitions
+  - `convert_openai_tool_to_claude()`: Converts between formats
+  - `create_tool_result()`: Standardized result wrapper with suggestions
+  - `think()`: Explicit reasoning tool for complex queries
 
 - `public/js/frontend.js`: Client-side JavaScript for chat interface
   - Integrates with ERPNext desk environment
   - Manages session creation and conversation state
   - Handles UI for chat dialog
+  - Collapsible "AI Reasoning" panel for thinking entries
+  - Entity chips for quick document access
 
 ### Frontend Integration
 - JavaScript loaded via `hooks.py` configuration
@@ -244,7 +256,9 @@ def list_your_doctype(
 
 ### 2. Define the Tool Schema
 
-Add a tool definition dictionary following OpenAI's function calling schema:
+Add a tool definition dictionary. The system supports both OpenAI and Claude formats:
+
+**OpenAI Format** (used internally, auto-converted for Claude):
 
 ```python
 list_your_doctype_tool = {
@@ -255,52 +269,33 @@ list_your_doctype_tool = {
         "parameters": {
             "type": "object",
             "properties": {
-                # Filter properties
-                "field1": {
-                    "type": "string",
-                    "description": "Filter by field1"
-                },
-                "status": {
-                    "type": "string",
-                    "enum": ["Draft", "Submitted", "Cancelled"],
-                    "description": "Document status"
-                },
-                "date_from": {
-                    "type": "string",
-                    "description": "Start date (YYYY-MM-DD)"
-                },
-                "date_to": {
-                    "type": "string",
-                    "description": "End date (YYYY-MM-DD)"
-                },
-
-                # Sorting properties
-                "sort_by": {
-                    "type": "string",
-                    "enum": ["creation", "modified", "name", "amount"],
-                    "description": "Field to sort by"
-                },
-                "sort_order": {
-                    "type": "string",
-                    "enum": ["asc", "desc"],
-                    "description": "Sort order"
-                },
-
-                # Pagination properties
-                "limit": {
-                    "type": "integer",
-                    "description": "Number of records to return (default: 10, max: 100)"
-                },
-                "offset": {
-                    "type": "integer",
-                    "description": "Number of records to skip"
-                }
+                "field1": {"type": "string", "description": "Filter by field1"},
+                "status": {"type": "string", "enum": ["Draft", "Submitted", "Cancelled"]},
+                "limit": {"type": "integer", "description": "Number of records (default: 10)"},
+                "offset": {"type": "integer", "description": "Records to skip"}
             },
-            "required": []  # Usually empty, as all parameters are optional
+            "required": []
         }
     }
 }
 ```
+
+**Claude Format** (auto-converted via `get_claude_tools()`):
+
+```python
+# Claude format has "input_schema" instead of "parameters"
+{
+    "name": "list_your_doctype",
+    "description": "List and search documents...",
+    "input_schema": {
+        "type": "object",
+        "properties": {...},
+        "required": []
+    }
+}
+```
+
+The `convert_openai_tool_to_claude()` function handles automatic conversion.
 
 ### 3. Register the Tool
 
@@ -517,8 +512,41 @@ For EVERY user request, follow this pattern:
 
 ### Architecture Notes
 
-The system uses `tool_choice="required"` which forces the AI to always call a tool. The loop continues until:
+The system uses an agentic loop that forces the AI to always call a tool:
+- **Claude**: Uses `tool_choice={"type": "any"}`
+- **OpenAI**: Uses `tool_choice="required"`
+
+The loop continues until:
 1. The AI calls `final_answer` (normal completion)
 2. Max iterations reached (safety limit: 15 iterations)
+3. Write operation requires user confirmation (pauses for approval)
+
+### Think Tool
+
+The `think` tool enables explicit reasoning for complex queries:
+
+```python
+# AI calls this before significant actions
+think(
+    reasoning="Looking up customer 'swissski' to get exact database name",
+    plan="1. Resolve entity 2. Query delivery notes 3. Return results",
+    observations="User wants recent deliveries, not historical data"
+)
+```
+
+**When to use `think`:**
+- Planning multi-step queries
+- Deciding between approaches after unexpected results
+- Documenting strategy for complex requests
+
+The frontend displays thinking entries in a collapsible "AI Reasoning" panel.
+
+### Recovery Logic
+
+When a tool returns empty results or errors, the system:
+1. Calls `analyze_tool_result()` to detect issues
+2. Generates recovery hints (e.g., "Try broader search terms")
+3. Injects hints via `inject_recovery_context()` as system notes
+4. The AI then adapts its strategy or reports findings
 
 This ensures the AI completes multi-step workflows reliably.

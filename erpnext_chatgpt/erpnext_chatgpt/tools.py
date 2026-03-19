@@ -95,6 +95,58 @@ def json_serial(obj):
         return ""
 
 
+def create_tool_result(data, total_count=None, truncated=False,
+                       filters_applied=None, suggestions=None, metadata=None):
+    """
+    Standardized result wrapper with suggestions for AI recovery.
+    Use this for consistent tool result formatting across all tools.
+    """
+    result = {
+        'data': data,
+        'result_status': 'success' if data else 'empty',
+        'total_count': total_count or (len(data) if isinstance(data, list) else (1 if data else 0)),
+    }
+
+    if truncated:
+        result['truncated'] = True
+        result['truncation_note'] = f"Results limited. {total_count} total exist."
+
+    if filters_applied:
+        result['filters_applied'] = filters_applied
+
+    if not data or (isinstance(data, list) and len(data) == 0):
+        result['suggestions'] = suggestions or [
+            "Verify entity name with lookup_entity",
+            "Try broader search criteria",
+            "Check if user meant a different document type"
+        ]
+
+    if metadata:
+        result['metadata'] = metadata
+
+    return result
+
+
+def convert_openai_tool_to_claude(openai_tool):
+    """
+    Convert an OpenAI-format tool definition to Claude format.
+
+    OpenAI: {"type": "function", "function": {"name": "...", "description": "...", "parameters": {...}}}
+    Claude: {"name": "...", "description": "...", "input_schema": {...}}
+    """
+    if openai_tool.get("type") == "function":
+        func_def = openai_tool.get("function", {})
+        claude_tool = {
+            "name": func_def.get("name", ""),
+            "description": func_def.get("description", ""),
+            "input_schema": func_def.get("parameters", {"type": "object", "properties": {}})
+        }
+        return claude_tool
+    else:
+        # Already in Claude format or unknown format
+        return openai_tool
+
+
 def final_answer(message, summary=None):
     """
     Signal that the AI has completed all necessary queries and is ready to respond.
@@ -134,6 +186,56 @@ Your message should be well-formatted with markdown, include relevant data, and 
                 }
             },
             "required": ["message"]
+        }
+    }
+}
+
+
+def think(reasoning, plan=None, observations=None):
+    """
+    Internal reasoning tool for AI to document thought process.
+    This is for explicit reasoning before taking actions.
+    """
+    return json.dumps({
+        '_thinking': True,
+        'reasoning': reasoning,
+        'plan': plan,
+        'observations': observations,
+        'message': 'Thinking recorded. Continue with your next action.'
+    }, default=json_serial)
+
+
+think_tool = {
+    "type": "function",
+    "function": {
+        "name": "think",
+        "description": """Use this to reason through complex queries BEFORE acting.
+
+Call when:
+- Planning multi-step queries
+- Last tool returned unexpected results
+- Deciding between approaches
+- Documenting strategy for complex requests
+
+This is for YOUR reasoning - does not produce user output.
+After thinking, continue with the appropriate action tool.""",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reasoning": {
+                    "type": "string",
+                    "description": "Your current reasoning about the task"
+                },
+                "plan": {
+                    "type": "string",
+                    "description": "Planned next steps (optional)"
+                },
+                "observations": {
+                    "type": "string",
+                    "description": "Key observations so far (optional)"
+                }
+            },
+            "required": ["reasoning"]
         }
     }
 }
@@ -426,6 +528,116 @@ CRITICAL: After calling lookup_entity, you MUST call the appropriate query tool 
                 }
             },
             "required": ["entity_type", "search_term"]
+        }
+    }
+}
+
+
+def global_search(text, doctypes=None, limit=20, start=0):
+    """
+    Full-text search across multiple doctypes using Frappe's global search index.
+    """
+    from frappe.utils.global_search import search
+
+    if not text or not text.strip():
+        return json.dumps({
+            'error': 'Search text is required',
+            'data': [],
+            'total_count': 0
+        }, default=json_serial)
+
+    limit = min(limit, 50)
+
+    try:
+        search_params = {
+            'text': text.strip(),
+            'start': start,
+            'limit': limit
+        }
+
+        if doctypes:
+            if isinstance(doctypes, str):
+                search_params['doctype'] = doctypes
+            elif isinstance(doctypes, list) and len(doctypes) == 1:
+                search_params['doctype'] = doctypes[0]
+            elif isinstance(doctypes, list):
+                search_params['scope'] = doctypes
+
+        results = search(**search_params)
+
+        formatted_results = []
+        for result in results:
+            formatted_results.append({
+                'doctype': result.doctype,
+                'name': result.name,
+                'content': result.content,
+                'route': result.route,
+                'title': getattr(result, 'title', result.name)
+            })
+
+        return json.dumps({
+            'data': formatted_results,
+            'total_count': len(formatted_results),
+            'search_text': text,
+            'limit': limit,
+            'offset': start,
+            'has_more': len(formatted_results) == limit,
+            'suggestions': [] if formatted_results else [
+                f"No results found for '{text}'",
+                "Try different keywords or check spelling",
+                "Use lookup_entity for exact name matching within a specific doctype"
+            ]
+        }, default=json_serial)
+
+    except Exception as e:
+        frappe.log_error(f"Global search error: {str(e)}", "Global Search Tool")
+        return json.dumps({
+            'error': str(e),
+            'data': [],
+            'total_count': 0
+        }, default=json_serial)
+
+
+global_search_tool = {
+    "type": "function",
+    "function": {
+        "name": "global_search",
+        "description": """Full-text search across multiple doctypes using Frappe's global search index.
+
+USE THIS TOOL WHEN:
+- User asks to "find" or "search for" something without specifying a doctype
+- User wants to search across multiple record types simultaneously
+- User is looking for documents containing specific keywords in their content
+
+DO NOT USE THIS TOOL WHEN:
+- You need to resolve an entity name to its exact database ID (use lookup_entity instead)
+- You already know the specific doctype to query (use the specific list_* tool)
+
+EXAMPLES:
+- "Find anything related to ski equipment" -> global_search(text="ski equipment")
+- "Search for invoices mentioning Project Alpha" -> global_search(text="Project Alpha", doctypes=["Sales Invoice"])""",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "Search keywords. Supports multiple words."
+                },
+                "doctypes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional list of doctypes to filter results. If omitted, searches all configured doctypes."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum results to return (default: 20, max: 50)"
+                },
+                "start": {
+                    "type": "integer",
+                    "description": "Pagination offset (default: 0)"
+                }
+            },
+            "required": ["text"]
         }
     }
 }
@@ -3164,7 +3376,9 @@ def get_tool_by_name(tool_name):
     """
     tool_map = {
         'final_answer': final_answer_tool,
+        'think': think_tool,
         'lookup_entity': lookup_entity_tool,
+        'global_search': global_search_tool,
         'get_sales_invoices': get_sales_invoices_tool,
         'get_sales_invoice': get_sales_invoice_tool,
         'list_invoices': list_invoices_tool,
@@ -3220,11 +3434,16 @@ def get_write_tool_metadata(tool_name):
 
 
 def get_tools():
+    """Get tools in OpenAI format (for backwards compatibility)."""
     return [
         # Final answer tool - MUST be called to respond to user
         final_answer_tool,
+        # Think tool - for AI reasoning
+        think_tool,
         # Entity lookup tool - should be used first to resolve informal names
         lookup_entity_tool,
+        # Global search tool - cross-doctype full-text search
+        global_search_tool,
         # Document query tools
         get_sales_invoices_tool,
         get_sales_invoice_tool,
@@ -3254,9 +3473,20 @@ def get_tools():
     ]
 
 
+def get_claude_tools():
+    """
+    Get tools in Claude/Anthropic format.
+    Converts OpenAI-format tool definitions to Claude format.
+    """
+    openai_tools = get_tools()
+    return [convert_openai_tool_to_claude(tool) for tool in openai_tools]
+
+
 available_functions = {
     "final_answer": final_answer,
+    "think": think,
     "lookup_entity": lookup_entity,
+    "global_search": global_search,
     "get_sales_invoices": get_sales_invoices,
     "get_sales_invoice": get_sales_invoice,
     "list_invoices": list_invoices,

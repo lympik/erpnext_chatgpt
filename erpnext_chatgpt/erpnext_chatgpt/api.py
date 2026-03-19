@@ -4,7 +4,7 @@ from frappe import _
 import json
 from typing import List, Dict, Any
 from erpnext_chatgpt.erpnext_chatgpt.tools import (
-    get_tools, available_functions, is_write_operation,
+    get_tools, get_claude_tools, available_functions, is_write_operation,
     get_write_tool_metadata, get_tool_by_name, json_serial
 )
 
@@ -28,21 +28,36 @@ Context:
 You MUST use tools for everything. You cannot respond directly.
 Call `final_answer` to deliver your response to the user.
 
+## Reasoning Protocol
+
+Before EACH significant action, consider using the `think` tool to document:
+1. What you're trying to achieve
+2. Why this tool is the right choice
+3. What you'll do with the result
+
+Example:
+think(reasoning="Looking up customer 'swissski' to get exact database name before querying delivery notes.")
+
 ## Workflow
 
-### Step 1: Entity Resolution (REQUIRED for informal names)
+### Step 1: Think & Plan
+For complex queries, use `think` to outline your approach.
+
+### Step 2: Entity Resolution (REQUIRED for informal names)
 When users mention customers, suppliers, items, or other entities by informal/partial names:
 - ALWAYS call `lookup_entity(entity_type, search_term)` first
 - Use `best_match.id` in subsequent queries
 - Example: "swissski" → lookup_entity("customer", "swissski") → "Swiss-Ski"
 
-### Step 2: Query Data
+### Step 3: Query Data
 Use resolved entity names in document queries.
 
-### Step 3: Drill Down (if needed)
-For details like serial numbers or line items, fetch the specific document.
+### Step 4: Handle Results & Adapt
+- **Empty results**: Check `suggestions` field if present, try ONE alternative approach
+- **Errors**: Read error context, adapt strategy
+- **After 2 attempts**: Report findings via `final_answer`
 
-### Step 4: Respond
+### Step 5: Respond
 Call `final_answer(message="...")` with formatted markdown.
 
 ## Tool Selection Guidelines
@@ -55,6 +70,12 @@ Call `final_answer(message="...")` with formatted markdown.
 
 **Multi-source queries:** For questions spanning multiple data types (e.g., "customers with overdue invoices AND recent deliveries"), query each source separately, then correlate in your response.
 
+## Error Recovery Strategies
+
+1. **Empty entity lookup**: Try broader search (remove special chars, use partial name)
+2. **No documents found**: Verify entity name, then report "no data"
+3. **Permission errors**: Report user may lack access
+
 ## Handling Results
 
 **IMPORTANT: Empty results are valid outcomes, not errors.**
@@ -64,13 +85,6 @@ Call `final_answer(message="...")` with formatted markdown.
 - **Too many results:** Add filters or summarize, offer to drill down.
 
 **Never loop endlessly.** If you've queried the data and it's empty, report that result via `final_answer`. The user needs to know there's no data, not see an error.
-
-## Efficiency
-
-You have limited iterations. Be strategic:
-- Don't re-query data you already have
-- Use summary tools over multiple granular queries
-- Plan before calling - avoid unnecessary tool calls
 
 ## Response Formatting (for final_answer)
 
@@ -86,10 +100,10 @@ You have limited iterations. Be strategic:
 
 ## Rules
 
+- Use `think` tool before complex decisions
 - NEVER skip entity lookup for informal names
 - NEVER respond without calling `final_answer`
-- NEVER retry queries hoping for different results - if data is empty, report it
-- If ambiguous, ask clarifying questions via `final_answer`
+- Maximum 2 retry attempts before reporting findings
 - Empty results = valid answer. Report "No X found for Y" via `final_answer`
 """
 
@@ -250,6 +264,152 @@ def get_openai_client():
     # Simple initialization - OpenAI SDK v1.x only needs api_key
     # Don't pass any proxy-related parameters
     return OpenAI(api_key=api_key)
+
+
+def get_anthropic_client():
+    """Get the Anthropic client with the API key from settings."""
+    api_key = frappe.db.get_single_value("OpenAI Settings", "api_key")
+    if not api_key:
+        frappe.throw(_("Anthropic API key is not set in OpenAI Settings."))
+
+    # Import Anthropic
+    from anthropic import Anthropic
+
+    return Anthropic(api_key=api_key)
+
+
+def get_api_provider():
+    """Get the configured API provider (openai or anthropic)."""
+    provider = frappe.db.get_single_value("OpenAI Settings", "api_provider")
+    return provider or "anthropic"  # Default to anthropic
+
+
+def analyze_tool_result(function_name, result_str):
+    """
+    Check if recovery action is needed based on tool result.
+    Returns (needs_recovery: bool, hint: str or None)
+    """
+    try:
+        result = json.loads(result_str)
+    except (json.JSONDecodeError, TypeError):
+        return False, None
+
+    # Check for empty results
+    if result.get('result_status') == 'empty':
+        suggestions = result.get('suggestions', [])
+        if suggestions:
+            return True, f"Query returned no results. Suggestions: {'; '.join(suggestions)}"
+        return True, "Query returned no results. Consider different approach."
+
+    # Check for errors
+    if 'error' in result:
+        return True, f"Tool error: {result['error']}. Adjust parameters or try different tool."
+
+    # Check for no matches in lookup
+    if function_name == 'lookup_entity' and not result.get('best_match'):
+        return True, f"No entity match found for '{result.get('search_term', 'unknown')}'. Try broader search terms."
+
+    return False, None
+
+
+def inject_recovery_context(conversation, hint, provider="anthropic"):
+    """Add system hint to guide recovery."""
+    if provider == "anthropic":
+        # For Claude, inject as user message with context marker
+        conversation.append({
+            "role": "user",
+            "content": f"[System Note]: {hint}"
+        })
+    else:
+        # For OpenAI, same approach
+        conversation.append({
+            "role": "user",
+            "content": f"[System Note]: {hint}"
+        })
+    return conversation
+
+
+def convert_openai_messages_to_claude(messages):
+    """
+    Convert OpenAI message format to Claude format.
+    Handles system messages, user messages, assistant messages, and tool results.
+    """
+    claude_messages = []
+    system_prompt = None
+
+    for msg in messages:
+        role = msg.get("role")
+
+        # Extract system message for separate handling
+        if role == "system":
+            system_prompt = msg.get("content", "")
+            continue
+
+        # User messages
+        if role == "user":
+            claude_messages.append({
+                "role": "user",
+                "content": msg.get("content", "")
+            })
+
+        # Assistant messages (may contain tool_calls)
+        elif role == "assistant":
+            content = msg.get("content")
+            tool_calls = msg.get("tool_calls")
+
+            if tool_calls:
+                # Convert tool calls to Claude format
+                content_blocks = []
+
+                # Add text content if present
+                if content:
+                    content_blocks.append({
+                        "type": "text",
+                        "text": content
+                    })
+
+                # Add tool use blocks
+                for tc in tool_calls:
+                    if hasattr(tc, 'function'):
+                        # OpenAI response object
+                        content_blocks.append({
+                            "type": "tool_use",
+                            "id": tc.id,
+                            "name": tc.function.name,
+                            "input": json.loads(tc.function.arguments) if tc.function.arguments else {}
+                        })
+                    elif isinstance(tc, dict):
+                        # Already a dict (from model_dump)
+                        func = tc.get('function', {})
+                        content_blocks.append({
+                            "type": "tool_use",
+                            "id": tc.get('id', ''),
+                            "name": func.get('name', ''),
+                            "input": json.loads(func.get('arguments', '{}')) if func.get('arguments') else {}
+                        })
+
+                claude_messages.append({
+                    "role": "assistant",
+                    "content": content_blocks
+                })
+            elif content:
+                claude_messages.append({
+                    "role": "assistant",
+                    "content": content
+                })
+
+        # Tool results (OpenAI format)
+        elif role == "tool":
+            claude_messages.append({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": msg.get("tool_call_id", ""),
+                    "content": msg.get("content", "")
+                }]
+            })
+
+    return system_prompt, claude_messages
 
 def extract_fetched_entities(function_name, response_data):
     """
@@ -465,7 +625,8 @@ def handle_tool_calls(tool_calls: List[Any], conversation: List[Dict[str, Any]],
         tool_usage_entry = {
             "tool_name": function_name,
             "parameters": function_args,
-            "timestamp": frappe.utils.now()
+            "timestamp": frappe.utils.now(),
+            "is_thinking": function_name == "think"  # Mark thinking entries
         }
 
         try:
@@ -598,21 +759,310 @@ def trim_conversation_to_token_limit(conversation: List[Dict[str, Any]], token_l
                 break
     return conversation
 
+def handle_claude_tool_calls(tool_blocks, conversation, tool_usage_log, session_doc=None):
+    """
+    Handle Claude tool calls by executing the corresponding functions.
+    Returns (conversation, tool_usage_log, pending_confirmation)
+    """
+    tool_results = []
+
+    for tool_block in tool_blocks:
+        function_name = tool_block.name
+        tool_use_id = tool_block.id
+        function_args = tool_block.input or {}
+
+        function_to_call = available_functions.get(function_name)
+        if not function_to_call:
+            frappe.log_error(f"Function {function_name} not found.", "Claude Tool Error")
+            raise ValueError(f"Function {function_name} not found.")
+
+        # Check if this is a write operation that requires user confirmation
+        if is_write_operation(function_name):
+            write_metadata = get_write_tool_metadata(function_name)
+            logger.debug(f"Write operation detected: {function_name}, requiring confirmation")
+
+            pending_confirmation = {
+                'tool_call_id': tool_use_id,
+                'tool_name': function_name,
+                'parameters': function_args,
+                'confirmation_message': write_metadata.get('confirmation_message', f'Execute {function_name}'),
+                'conversation_state': conversation.copy(),
+                'tool_usage_log': tool_usage_log.copy(),
+                'created_at': frappe.utils.now()
+            }
+
+            if session_doc:
+                session_doc.pending_confirmation = json.dumps(pending_confirmation, default=json_serial)
+                session_doc.save(ignore_permissions=False)
+                frappe.db.commit()
+
+            return conversation, tool_usage_log, pending_confirmation
+
+        # Log the tool usage
+        tool_usage_entry = {
+            "tool_name": function_name,
+            "parameters": function_args,
+            "timestamp": frappe.utils.now(),
+            "is_thinking": function_name == "think"
+        }
+
+        try:
+            function_response = function_to_call(**function_args)
+
+            # Parse response for summary
+            response_data = {}
+            try:
+                response_data = json.loads(function_response)
+                if isinstance(response_data, dict):
+                    if 'delivery_notes' in response_data:
+                        tool_usage_entry['result_summary'] = f"Retrieved {len(response_data['delivery_notes'])} delivery notes"
+                    elif 'invoices' in response_data:
+                        tool_usage_entry['result_summary'] = f"Retrieved {len(response_data['invoices'])} invoices"
+                    elif 'total_count' in response_data:
+                        tool_usage_entry['result_summary'] = f"Found {response_data.get('total_count', 0)} records"
+                    else:
+                        tool_usage_entry['result_summary'] = "Data retrieved successfully"
+            except:
+                tool_usage_entry['result_summary'] = "Query executed"
+
+            tool_usage_entry['status'] = 'success'
+            tool_usage_entry['fetched_entities'] = extract_fetched_entities(function_name, response_data if isinstance(response_data, dict) else {})
+
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": str(function_response)
+            })
+
+            # Check for recovery hints
+            needs_recovery, hint = analyze_tool_result(function_name, function_response)
+            if needs_recovery and hint:
+                tool_usage_entry['recovery_hint'] = hint
+
+        except Exception as e:
+            error_title = f"Tool Error: {function_name}"[:140]
+            error_message = f"Function: {function_name}\nArgs: {json.dumps(function_args)}\nError: {str(e)}"
+            frappe.log_error(message=error_message, title=error_title)
+            tool_usage_entry['status'] = 'error'
+            tool_usage_entry['error'] = str(e)
+
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": json.dumps({"error": str(e)}),
+                "is_error": True
+            })
+
+        tool_usage_log.append(tool_usage_entry)
+
+    # Add all tool results as a user message
+    if tool_results:
+        conversation.append({
+            "role": "user",
+            "content": tool_results
+        })
+
+    return conversation, tool_usage_log, None
+
+
+def run_claude_agentic_loop(client, model, system_prompt, conversation, tool_usage_log, session_doc, max_tokens):
+    """
+    Run the Claude agentic loop until final_answer is called or max iterations reached.
+    """
+    tools = get_claude_tools()
+    max_iterations = 15
+    iteration = 0
+
+    while iteration < max_iterations:
+        iteration += 1
+
+        try:
+            response = client.messages.create(
+                model=model,
+                max_tokens=4096,
+                system=system_prompt,
+                messages=conversation,
+                tools=tools,
+                tool_choice={"type": "any"}  # Force tool use
+            )
+        except Exception as e:
+            logger.error(f"Claude API error: {str(e)}")
+            raise
+
+        logger.debug(f"Claude Response (iteration {iteration}): stop_reason={response.stop_reason}")
+
+        # Process the response content
+        tool_blocks = [block for block in response.content if block.type == "tool_use"]
+        text_blocks = [block for block in response.content if block.type == "text"]
+
+        if not tool_blocks:
+            # No tool calls - shouldn't happen with tool_choice=any
+            logger.warning("No tool calls returned despite tool_choice=any")
+            text_content = " ".join([b.text for b in text_blocks]) if text_blocks else "No response generated."
+            return {
+                "role": "assistant",
+                "content": text_content,
+                "tool_usage": tool_usage_log,
+                "iterations": iteration,
+                "session_id": session_doc.name if session_doc else None
+            }
+
+        # Check for final_answer
+        for tool_block in tool_blocks:
+            if tool_block.name == "final_answer":
+                try:
+                    final_args = tool_block.input or {}
+                    logger.debug(f"Final answer received after {iteration} iterations")
+
+                    message = final_args.get("message", "")
+                    message = auto_link_document_ids(message)
+
+                    # Build context summary
+                    context_parts = []
+                    for tool_entry in tool_usage_log:
+                        tool_name = tool_entry.get("tool_name", "")
+                        params = tool_entry.get("parameters", {})
+                        if params and tool_name not in ["final_answer", "think"]:
+                            param_str = ", ".join(f"{k}={v}" for k, v in params.items() if v is not None)
+                            context_parts.append(f"{tool_name}({param_str})")
+
+                    if context_parts:
+                        context_note = "\n\n<!-- CONTEXT: " + " | ".join(context_parts) + " -->"
+                        message_with_context = message + context_note
+                    else:
+                        message_with_context = message
+
+                    # Add assistant response
+                    assistant_message = {
+                        "role": "assistant",
+                        "content": message_with_context,
+                        "content_display": message,
+                        "tool_usage": tool_usage_log
+                    }
+                    conversation.append(assistant_message)
+
+                    # Save conversation
+                    if session_doc:
+                        messages_to_save = extract_messages_for_storage(conversation)
+                        session_doc.messages = json.dumps(messages_to_save)
+                        session_doc.model_used = model
+                        session_doc.save(ignore_permissions=False)
+                        frappe.db.commit()
+
+                    return {
+                        "role": "assistant",
+                        "content": message_with_context,
+                        "content_display": message,
+                        "tool_usage": tool_usage_log,
+                        "summary": final_args.get("summary"),
+                        "iterations": iteration,
+                        "session_id": session_doc.name if session_doc else None
+                    }
+                except Exception as e:
+                    logger.error(f"Failed to parse final_answer: {e}")
+                    return {
+                        "role": "assistant",
+                        "content": "I encountered an error formatting my response.",
+                        "tool_usage": tool_usage_log,
+                        "error": str(e),
+                        "session_id": session_doc.name if session_doc else None
+                    }
+
+        # No final_answer yet - add assistant message with tool calls and handle them
+        # Build assistant message content
+        assistant_content = []
+        for block in text_blocks:
+            assistant_content.append({"type": "text", "text": block.text})
+        for block in tool_blocks:
+            assistant_content.append({
+                "type": "tool_use",
+                "id": block.id,
+                "name": block.name,
+                "input": block.input
+            })
+
+        conversation.append({
+            "role": "assistant",
+            "content": assistant_content
+        })
+
+        # Handle tool calls
+        conversation, tool_usage_log, pending_confirmation = handle_claude_tool_calls(
+            tool_blocks, conversation, tool_usage_log, session_doc
+        )
+
+        if pending_confirmation:
+            return {
+                "status": "pending_confirmation",
+                "pending_confirmation": pending_confirmation,
+                "tool_usage": tool_usage_log,
+                "session_id": session_doc.name if session_doc else None
+            }
+
+        # Check for recovery hints and inject context
+        for entry in tool_usage_log[-len(tool_blocks):]:
+            if entry.get('recovery_hint'):
+                conversation = inject_recovery_context(conversation, entry['recovery_hint'], "anthropic")
+                break  # Only inject one hint per iteration
+
+        logger.debug(f"Handled {len(tool_blocks)} tool calls, continuing to iteration {iteration + 1}")
+
+    # Max iterations reached - ask user if they want to continue
+    logger.warning(f"Hit max iterations ({max_iterations}) without final_answer")
+
+    # Build progress summary for user
+    tools_called = [t.get('tool_name') for t in tool_usage_log if t.get('tool_name') != 'think']
+    thinking_steps = len([t for t in tool_usage_log if t.get('is_thinking')])
+
+    progress_summary = {
+        "iterations_used": iteration,
+        "max_iterations": max_iterations,
+        "tools_called": tools_called,
+        "thinking_steps": thinking_steps,
+        "total_tool_calls": len(tool_usage_log)
+    }
+
+    # Save conversation state for potential continuation
+    if session_doc:
+        # Store the current conversation state for continuation
+        continuation_state = {
+            "conversation": conversation,
+            "tool_usage_log": tool_usage_log,
+            "iteration": iteration,
+            "created_at": frappe.utils.now()
+        }
+        session_doc.continuation_state = json.dumps(continuation_state, default=json_serial)
+        messages_to_save = extract_messages_for_storage(conversation)
+        session_doc.messages = json.dumps(messages_to_save)
+        session_doc.model_used = model
+        session_doc.save(ignore_permissions=False)
+        frappe.db.commit()
+
+    return {
+        "status": "limit_reached",
+        "progress_summary": progress_summary,
+        "tool_usage": tool_usage_log,
+        "message": f"I've made {len(tools_called)} tool calls across {iteration} iterations but haven't finished yet. Would you like me to continue?",
+        "session_id": session_doc.name if session_doc else None
+    }
+
+
 @frappe.whitelist()
 def ask_openai_question(session_id: str, message: str) -> Dict[str, Any]:
     """
-    Ask a question to the OpenAI model and handle the response.
+    Ask a question to the AI model (Claude or OpenAI) and handle the response.
     Track all tool usage for transparency.
 
     :param session_id: The conversation session ID
     :param message: The user's new message
-    :return: The response from OpenAI with tool usage information.
+    :return: The response from the AI with tool usage information.
     """
     try:
         if not session_id or not message:
             return {"error": "session_id and message are required", "tool_usage": []}
 
-        client = get_openai_client()
+        # Check which provider to use
+        provider = get_api_provider()
         tool_usage_log = []
 
         # Load conversation from database
@@ -646,8 +1096,33 @@ def ask_openai_question(session_id: str, message: str) -> Dict[str, Any]:
         # Trim conversation to stay within the token limit
         conversation = trim_conversation_to_token_limit(conversation, max_tokens)
 
-        logger.debug(f"Conversation: {json.dumps(conversation)}")
+        logger.debug(f"Conversation (provider={provider}): {json.dumps(conversation)}")
 
+        # Route to appropriate provider
+        if provider == "anthropic":
+            # Use Claude
+            client = get_anthropic_client()
+
+            # Extract system prompt and convert messages to Claude format
+            system_prompt = None
+            claude_messages = []
+
+            for msg in conversation:
+                if msg.get("role") == "system":
+                    system_prompt = msg.get("content", "")
+                else:
+                    claude_messages.append(msg)
+
+            if not system_prompt:
+                system_prompt = get_system_instructions()
+
+            return run_claude_agentic_loop(
+                client, model, system_prompt, claude_messages,
+                tool_usage_log, session_doc, max_tokens
+            )
+
+        # Default: Use OpenAI
+        client = get_openai_client()
         tools = get_tools()
 
         # Agentic tool-only loop
@@ -767,18 +1242,30 @@ def ask_openai_question(session_id: str, message: str) -> Dict[str, Any]:
 
             logger.debug(f"Handled {len(tool_calls)} tool calls, continuing to iteration {iteration + 1}")
 
-        # If we hit max iterations, force a response
+        # If we hit max iterations, ask user if they want to continue
         logger.warning(f"Hit max iterations ({max_iterations}) without final_answer")
 
-        # Save conversation state even on max iterations
-        error_message = "I was unable to complete the request within the allowed number of steps. Please try a simpler query."
-        conversation.append({
-            "role": "assistant",
-            "content": error_message,
-            "tool_usage": tool_usage_log
-        })
+        # Build progress summary for user
+        tools_called = [t.get('tool_name') for t in tool_usage_log if t.get('tool_name') != 'think']
+        thinking_steps = len([t for t in tool_usage_log if t.get('is_thinking')])
 
+        progress_summary = {
+            "iterations_used": iteration,
+            "max_iterations": max_iterations,
+            "tools_called": tools_called,
+            "thinking_steps": thinking_steps,
+            "total_tool_calls": len(tool_usage_log)
+        }
+
+        # Save conversation state for potential continuation
         if session_doc:
+            continuation_state = {
+                "conversation": conversation,
+                "tool_usage_log": tool_usage_log,
+                "iteration": iteration,
+                "created_at": frappe.utils.now()
+            }
+            session_doc.continuation_state = json.dumps(continuation_state, default=json_serial)
             messages_to_save = extract_messages_for_storage(conversation)
             session_doc.messages = json.dumps(messages_to_save)
             session_doc.model_used = model
@@ -786,10 +1273,10 @@ def ask_openai_question(session_id: str, message: str) -> Dict[str, Any]:
             frappe.db.commit()
 
         return {
-            "role": "assistant",
-            "content": error_message,
+            "status": "limit_reached",
+            "progress_summary": progress_summary,
             "tool_usage": tool_usage_log,
-            "error": "max_iterations_reached",
+            "message": f"I've made {len(tools_called)} tool calls across {iteration} iterations but haven't finished yet. Would you like me to continue?",
             "session_id": session_doc.name if session_doc else None
         }
     except Exception as e:
@@ -991,6 +1478,14 @@ def get_conversation(session_id: str) -> Dict[str, Any]:
         # Filter to only return user and assistant messages (no tool responses)
         messages = extract_messages_for_storage(raw_messages)
 
+        # Check for continuation state (limit reached)
+        continuation_state = None
+        if doc.continuation_state:
+            try:
+                continuation_state = json.loads(doc.continuation_state)
+            except json.JSONDecodeError:
+                continuation_state = None
+
         return {
             "success": True,
             "session_id": doc.name,
@@ -1000,7 +1495,8 @@ def get_conversation(session_id: str) -> Dict[str, Any]:
             "message_count": doc.message_count,
             "last_message_at": str(doc.last_message_at) if doc.last_message_at else None,
             "model_used": doc.model_used,
-            "created_at": str(doc.creation)
+            "created_at": str(doc.creation),
+            "continuation_state": continuation_state
         }
     except frappe.DoesNotExistError:
         return {"success": False, "error": "Conversation not found"}
@@ -1088,6 +1584,332 @@ def delete_conversation(session_id: str) -> Dict[str, Any]:
     except Exception as e:
         frappe.log_error(message=str(e), title="Delete Conversation Error")
         return {"success": False, "error": str(e)}
+
+
+@frappe.whitelist()
+def get_debug_data(session_id: str) -> Dict[str, Any]:
+    """
+    Get detailed debug data for a conversation session.
+    Used for troubleshooting conversation issues.
+
+    :param session_id: The conversation session ID
+    :return: Dictionary with detailed session data and settings
+    """
+    try:
+        doc = frappe.get_doc("AI Conversation", session_id)
+
+        # Check permission using owner field
+        if doc.owner != frappe.session.user and "System Manager" not in frappe.get_roles():
+            frappe.throw("You don't have permission to access this conversation")
+
+        # Get settings (without exposing API key)
+        settings = frappe.get_single("OpenAI Settings")
+        settings_info = {
+            "api_provider": settings.api_provider if hasattr(settings, 'api_provider') else 'openai',
+            "model": settings.model,
+            "max_tokens": settings.max_tokens,
+            "has_api_key": bool(settings.api_key),
+            "has_system_instructions": bool(settings.system_instructions)
+        }
+
+        # Parse messages
+        messages = []
+        try:
+            messages = json.loads(doc.messages) if doc.messages else []
+        except json.JSONDecodeError as e:
+            messages = {"parse_error": str(e), "raw_length": len(doc.messages) if doc.messages else 0}
+
+        # Extract tool usage from all messages
+        tool_usage_summary = []
+        if isinstance(messages, list):
+            for i, msg in enumerate(messages):
+                if isinstance(msg, dict) and msg.get('tool_usage'):
+                    tool_usage_summary.append({
+                        "message_index": i,
+                        "tool_count": len(msg['tool_usage']),
+                        "tools": [t.get('tool_name') for t in msg['tool_usage']]
+                    })
+
+        # Get pending confirmation if any
+        pending = None
+        if doc.pending_confirmation:
+            try:
+                pending = json.loads(doc.pending_confirmation)
+            except json.JSONDecodeError:
+                pending = {"parse_error": "Could not parse pending confirmation"}
+
+        return {
+            "success": True,
+            "session": {
+                "id": doc.name,
+                "title": doc.title,
+                "status": doc.status,
+                "owner": doc.owner,
+                "created": str(doc.creation),
+                "modified": str(doc.modified),
+                "model_used": doc.model_used,
+                "message_count": doc.message_count
+            },
+            "messages": messages,
+            "tool_usage_summary": tool_usage_summary,
+            "pending_confirmation": pending,
+            "settings": settings_info,
+            "system_info": {
+                "frappe_user": frappe.session.user,
+                "frappe_site": frappe.local.site,
+                "server_time": frappe.utils.now()
+            }
+        }
+    except frappe.DoesNotExistError:
+        return {"success": False, "error": "Conversation not found"}
+    except Exception as e:
+        frappe.log_error(message=str(e), title="Get Debug Data Error")
+        return {"success": False, "error": str(e)}
+
+
+# =============================================================================
+# Iteration Limit Continuation API
+# =============================================================================
+
+@frappe.whitelist()
+def continue_from_limit(session_id: str, action: str = "continue") -> Dict[str, Any]:
+    """
+    Continue or stop the agentic loop after hitting the iteration limit.
+
+    :param session_id: The conversation session ID
+    :param action: "continue" to resume processing, "stop" to accept current state
+    :return: Dictionary with result or continued conversation response
+    """
+    try:
+        if not session_id:
+            return {"error": "session_id is required", "tool_usage": []}
+
+        session_doc = frappe.get_doc("AI Conversation", session_id)
+
+        # Check permission
+        if session_doc.owner != frappe.session.user and "System Manager" not in frappe.get_roles():
+            frappe.throw("You don't have permission to access this conversation")
+
+        # Validate action parameter
+        if action not in ("continue", "stop"):
+            return {"error": f"Invalid action: {action}. Must be 'continue' or 'stop'", "tool_usage": []}
+
+        # Get continuation state
+        if not session_doc.continuation_state:
+            return {"error": "No continuation state found", "tool_usage": []}
+
+        try:
+            continuation_state = json.loads(session_doc.continuation_state)
+        except json.JSONDecodeError:
+            return {"error": "Invalid continuation state data", "tool_usage": []}
+
+        # Validate continuation_state structure
+        if not isinstance(continuation_state.get('conversation'), list):
+            return {"error": "Invalid continuation state: missing conversation", "tool_usage": []}
+        if not isinstance(continuation_state.get('tool_usage_log'), list):
+            continuation_state['tool_usage_log'] = []  # Default to empty list
+        if not isinstance(continuation_state.get('iteration'), int):
+            continuation_state['iteration'] = 0  # Default to 0
+
+        if action == "stop":
+            # User chose to stop - clear continuation state and return a message
+            session_doc.continuation_state = None
+            session_doc.save(ignore_permissions=False)
+            frappe.db.commit()
+
+            tool_usage_log = continuation_state.get('tool_usage_log', [])
+            tools_called = [t.get('tool_name') for t in tool_usage_log if t.get('tool_name') != 'think']
+
+            stop_message = f"Processing stopped after {len(tools_called)} tool calls. The data gathered so far has been preserved in the conversation."
+
+            return {
+                "role": "assistant",
+                "content": stop_message,
+                "content_display": stop_message,
+                "tool_usage": tool_usage_log,
+                "session_id": session_id
+            }
+
+        # action == "continue" - resume the agentic loop
+        conversation = continuation_state.get('conversation', [])
+        tool_usage_log = continuation_state.get('tool_usage_log', [])
+        previous_iteration = continuation_state.get('iteration', 0)
+
+        # Clear continuation state before continuing
+        session_doc.continuation_state = None
+        session_doc.save(ignore_permissions=False)
+        frappe.db.commit()
+
+        # Get provider and continue with appropriate loop
+        provider = get_api_provider()
+        model, max_tokens = get_model_settings()
+
+        if provider == "anthropic":
+            client = get_anthropic_client()
+
+            # Extract system prompt
+            system_prompt = None
+            claude_messages = []
+            for msg in conversation:
+                if msg.get("role") == "system":
+                    system_prompt = msg.get("content", "")
+                else:
+                    claude_messages.append(msg)
+
+            if not system_prompt:
+                system_prompt = get_system_instructions()
+
+            # Add a continuation hint
+            claude_messages.append({
+                "role": "user",
+                "content": "[System Note]: The user has requested to continue processing. Please continue from where you left off and complete the task. If you have gathered enough information, call final_answer now."
+            })
+
+            return run_claude_agentic_loop(
+                client, model, system_prompt, claude_messages,
+                tool_usage_log, session_doc, max_tokens
+            )
+        else:
+            # OpenAI continuation
+            client = get_openai_client()
+            tools = get_tools()
+
+            # Add continuation hint
+            conversation.append({
+                "role": "user",
+                "content": "[System Note]: The user has requested to continue processing. Please continue from where you left off and complete the task. If you have gathered enough information, call final_answer now."
+            })
+
+            # Continue the loop with remaining iterations
+            max_iterations = 15
+            iteration = 0
+
+            while iteration < max_iterations:
+                iteration += 1
+
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=conversation,
+                    tools=tools,
+                    tool_choice="required"
+                )
+
+                response_message = response.choices[0].message
+                tool_calls = response_message.tool_calls
+
+                if not tool_calls:
+                    response_data = response_message.model_dump()
+                    response_data['tool_usage'] = tool_usage_log
+                    return response_data
+
+                # Check for final_answer
+                for tool_call in tool_calls:
+                    if tool_call.function.name == "final_answer":
+                        try:
+                            final_args = json.loads(tool_call.function.arguments)
+                            message = final_args.get("message", "")
+                            message = auto_link_document_ids(message)
+
+                            context_parts = []
+                            for tool_entry in tool_usage_log:
+                                tool_name = tool_entry.get("tool_name", "")
+                                params = tool_entry.get("parameters", {})
+                                if params and tool_name not in ["final_answer", "think"]:
+                                    param_str = ", ".join(f"{k}={v}" for k, v in params.items() if v is not None)
+                                    context_parts.append(f"{tool_name}({param_str})")
+
+                            if context_parts:
+                                context_note = "\n\n<!-- CONTEXT: " + " | ".join(context_parts) + " -->"
+                                message_with_context = message + context_note
+                            else:
+                                message_with_context = message
+
+                            assistant_message = {
+                                "role": "assistant",
+                                "content": message_with_context,
+                                "content_display": message,
+                                "tool_usage": tool_usage_log
+                            }
+                            conversation.append(assistant_message)
+
+                            messages_to_save = extract_messages_for_storage(conversation)
+                            session_doc.messages = json.dumps(messages_to_save)
+                            session_doc.model_used = model
+                            session_doc.save(ignore_permissions=False)
+                            frappe.db.commit()
+
+                            return {
+                                "role": "assistant",
+                                "content": message_with_context,
+                                "content_display": message,
+                                "tool_usage": tool_usage_log,
+                                "summary": final_args.get("summary"),
+                                "iterations": previous_iteration + iteration,
+                                "session_id": session_id
+                            }
+                        except json.JSONDecodeError as e:
+                            return {
+                                "role": "assistant",
+                                "content": "I encountered an error formatting my response.",
+                                "tool_usage": tool_usage_log,
+                                "error": str(e),
+                                "session_id": session_id
+                            }
+
+                # Handle tool calls
+                conversation.append(response_message.model_dump())
+                conversation, tool_usage_log, pending_confirmation = handle_tool_calls(
+                    tool_calls, conversation, tool_usage_log, session_doc
+                )
+
+                if pending_confirmation:
+                    return {
+                        "status": "pending_confirmation",
+                        "pending_confirmation": pending_confirmation,
+                        "tool_usage": tool_usage_log,
+                        "session_id": session_id
+                    }
+
+                conversation = trim_conversation_to_token_limit(conversation, max_tokens)
+
+            # Hit limit again
+            tools_called = [t.get('tool_name') for t in tool_usage_log if t.get('tool_name') != 'think']
+            thinking_steps = len([t for t in tool_usage_log if t.get('is_thinking')])
+
+            progress_summary = {
+                "iterations_used": previous_iteration + iteration,
+                "max_iterations": max_iterations,
+                "tools_called": tools_called,
+                "thinking_steps": thinking_steps,
+                "total_tool_calls": len(tool_usage_log)
+            }
+
+            continuation_state = {
+                "conversation": conversation,
+                "tool_usage_log": tool_usage_log,
+                "iteration": previous_iteration + iteration,
+                "created_at": frappe.utils.now()
+            }
+            session_doc.continuation_state = json.dumps(continuation_state, default=json_serial)
+            messages_to_save = extract_messages_for_storage(conversation)
+            session_doc.messages = json.dumps(messages_to_save)
+            session_doc.model_used = model
+            session_doc.save(ignore_permissions=False)
+            frappe.db.commit()
+
+            return {
+                "status": "limit_reached",
+                "progress_summary": progress_summary,
+                "tool_usage": tool_usage_log,
+                "message": f"I've now made {len(tools_called)} tool calls across {previous_iteration + iteration} total iterations but still haven't finished. Would you like me to continue?",
+                "session_id": session_id
+            }
+
+    except frappe.DoesNotExistError:
+        return {"error": "Conversation session not found", "tool_usage": []}
+    except Exception as e:
+        frappe.log_error(message=str(e), title="Continue From Limit Error")
+        return {"error": str(e), "tool_usage": []}
 
 
 # =============================================================================

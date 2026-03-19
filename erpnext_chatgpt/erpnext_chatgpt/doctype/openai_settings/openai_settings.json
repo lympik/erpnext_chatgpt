@@ -7,19 +7,29 @@
   "icon": "fa fa-cog",
   "fields": [
     {
+      "fieldname": "api_provider",
+      "fieldtype": "Select",
+      "label": "API Provider",
+      "options": "anthropic\nopenai",
+      "default": "anthropic",
+      "reqd": 1,
+      "description": "Select the AI provider. Anthropic (Claude) is recommended for better agentic capabilities."
+    },
+    {
       "fieldname": "api_key",
-      "fieldtype": "Data",
+      "fieldtype": "Password",
       "label": "API Key",
-      "reqd": 1
+      "reqd": 1,
+      "description": "API key for the selected provider (Anthropic or OpenAI)"
     },
     {
       "fieldname": "model",
       "fieldtype": "Select",
       "label": "Model",
-      "options": "gpt-4.1\ngpt-4o\ngpt-4o-mini\no4-mini\no3\no3-mini\no3-pro\ngpt-4-turbo\ngpt-3.5-turbo",
-      "default": "gpt-4.1",
+      "options": "claude-sonnet-4-20250514\nclaude-opus-4-5-20250514\nclaude-3-5-sonnet-20241022\nclaude-3-5-haiku-20241022\ngpt-4.1\ngpt-4o\ngpt-4o-mini\no4-mini\no3\no3-mini\no3-pro\ngpt-4-turbo\ngpt-3.5-turbo",
+      "default": "claude-sonnet-4-20250514",
       "reqd": 1,
-      "description": "Select the OpenAI model. GPT-4.1 is the smartest non-reasoning model. o3/o4-mini are reasoning models for complex tasks."
+      "description": "Select the model. Claude Sonnet 4 is recommended for best balance of speed and capability. For Anthropic, use claude-* models. For OpenAI, use gpt-* or o-* models."
     },
     {
       "fieldname": "max_tokens",
