@@ -1118,6 +1118,17 @@ function displayConversation(conversation) {
       return; // Skip messages with no content
     }
 
+    // Skip intermediate tool messages (Claude API format)
+    // These have content as an array containing tool_use or tool_result objects
+    if (Array.isArray(displayContent)) {
+      const isToolUseOnly = displayContent.every(item =>
+        item && (item.type === "tool_use" || item.type === "tool_result")
+      );
+      if (isToolUseOnly) {
+        return; // Skip tool_use/tool_result messages - they're intermediate API messages
+      }
+    }
+
     // For assistant messages, skip if it only has tool_calls (no final answer)
     if (role === "assistant" && message.tool_calls && !displayContent) {
       return;
