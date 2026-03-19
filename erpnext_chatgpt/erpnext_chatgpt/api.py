@@ -276,25 +276,27 @@ def get_model_settings():
 
 
 def get_model_output_limit(model: str) -> int:
-    """Get the maximum output tokens for a model."""
+    """Get the maximum output tokens for a model.
+
+    Note: Anthropic requires streaming for requests that may take >10 minutes.
+    Keep output limits reasonable (4096-8192) to avoid streaming requirement.
+    """
     output_limits = {
-        # Claude Sonnet 4 supports up to 64K output
-        "claude-sonnet-4-20250514": 16000,
-        # Claude Opus 4 supports up to 32K output
-        "claude-opus-4-20250514": 16000,
-        # Older Claude models
-        "claude-3-5-sonnet-20241022": 8192,
-        "claude-3-5-haiku-20241022": 8192,
+        # Claude models - keep at 4096 to avoid streaming requirement
+        "claude-sonnet-4-20250514": 4096,
+        "claude-opus-4-20250514": 4096,
+        "claude-3-5-sonnet-20241022": 4096,
+        "claude-3-5-haiku-20241022": 4096,
         # GPT-4 models
-        "gpt-4o": 16384,
+        "gpt-4o": 4096,
         "gpt-4-turbo": 4096,
-        "gpt-4o-mini": 16384,
+        "gpt-4o-mini": 4096,
         # Reasoning models
-        "o3-mini": 16384,
-        "o4-mini": 16384,
+        "o3-mini": 4096,
+        "o4-mini": 4096,
     }
-    # Default to 8192 for unknown models
-    return output_limits.get(model, 8192)
+    # Default to 4096 for safety
+    return output_limits.get(model, 4096)
 
 def get_openai_client():
     """Get the OpenAI client with the API key from settings."""
